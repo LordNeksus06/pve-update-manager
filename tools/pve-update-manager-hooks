@@ -1,0 +1,347 @@
+#!/bin/bash
+# Puts pve-update-manager into Proxmox' web interface and API, and takes it out
+# again.
+#
+#   pve-update-manager-hooks apply    (re)apply every hook, then reload services
+#   pve-update-manager-hooks revert   remove every hook, then reload services
+#   pve-update-manager-hooks status   report what is currently in place
+#
+# Four edits, all of them one line, all of them idempotent:
+#
+#   index.html.tpl   one <script> tag after pvemanagerlib.js, so the browser
+#                    loads the tab code
+#   pvedaemon        one `require` so the API routes exist in the daemon that
+#                    executes them
+#   pveproxy         the same `require`, because pveproxy resolves the route
+#                    itself before it decides to forward the call
+#   pvesh            the same `require`, so the endpoints are reachable from the
+#                    command line too - pvesh resolves the requested path while
+#                    it is being imported, which is why the line is a BEGIN block
+#                    placed above it
+#
+# Those four files belong to pve-manager, so an upgrade of that package throws
+# the edits away. That is why this script is idempotent and why the package
+# registers a dpkg trigger on /usr/share/pve-manager: after every pve-manager
+# upgrade it runs again and puts the lines back.
+#
+# The Perl edits are verified with `perl -Tc` before the original is let go. A
+# botched edit to pvedaemon would take down the whole Proxmox API, so on a failed
+# check the backup goes straight back and the script exits non-zero.
+
+set -euo pipefail
+
+TPL_ANCHOR='pvemanagerlib\.js'
+
+# The tag carries a version, exactly like Proxmox' own script tags do
+# (pvemanagerlib.js?ver=...). Without one the browser has no reason ever to
+# fetch the file again: after an upgrade it keeps running the old interface
+# against the new API, which shows up as a button that is gone calling an
+# endpoint that no longer exists. The version is the CONTENT of the file, so it
+# changes when - and only when - the file does, and a rebuild that changes
+# nothing does not churn index.html.tpl.
+TPL_JS="${PVEUM_TPL_JS:-/usr/share/pve-manager/js/pve-update-manager.js}"
+
+# What identifies our tag no matter which version it carries. Precise enough not
+# to repeat the old mistake of matching the bare package name: this is a path to
+# our own file, which nothing else can legitimately mention.
+TPL_TAG_MATCH='src="/pve2/js/pve-update-manager.js'
+
+tpl_line() {
+    local ver='0'
+
+    if [ -r "$TPL_JS" ]; then
+        ver="$(md5sum "$TPL_JS" | cut -c1-10)"
+    fi
+
+    printf '    <script type="text/javascript" src="/pve2/js/pve-update-manager.js?ver=%s"></script> <!-- pve-update-manager -->' "$ver"
+}
+
+# The daemons load their entry point as PVE::Service::<name>, pvesh as
+# PVE::CLI::pvesh - one anchor covers all three, and only the FIRST match is used
+# anyway.
+PERL_ANCHOR='^use PVE::(Service|CLI)::'
+# A BEGIN block, and not a plain `eval { require ... };`, because `use` IS a
+# BEGIN block: every `use` in the file runs before any runtime statement, no
+# matter which line it sits on. PVE::CLI::pvesh resolves the requested API path
+# in its module body - that is, while its `use` is still running - so a runtime
+# require can never register the routes early enough, and pvesh would answer
+# "No 'get' handler defined" while the web interface worked fine.
+PERL_LINE='BEGIN { eval { require PVE::UpdateManager::Inject; }; } # pve-update-manager'
+
+# The paths are overridable so the test suite can run the real script against
+# copies in a tmpdir. Nothing but the tests ever sets them; on a Proxmox host the
+# defaults are the only values that make sense.
+TPL="${PVEUM_TPL:-/usr/share/pve-manager/index.html.tpl}"
+BACKUP_DIR="${PVEUM_BACKUP_DIR:-/var/lib/pve-update-manager/backup}"
+
+if [ -n "${PVEUM_PERL_TARGETS:-}" ]; then
+    read -r -a PERL_TARGETS <<< "$PVEUM_PERL_TARGETS"
+else
+    PERL_TARGETS=('/usr/bin/pvedaemon' '/usr/bin/pveproxy' '/usr/bin/pvesh')
+fi
+
+QUIET=0
+
+msg() {
+    [ "$QUIET" = "1" ] && return 0
+    echo ":: $*"
+}
+
+warn() {
+    echo "!! $*" >&2
+}
+
+backup_of() {
+    echo "$BACKUP_DIR/$(echo "$1" | tr '/' '_')"
+}
+
+# Inserts $line into $file relative to the first line matching $anchor - after it
+# when $where is "after", before it when "before".
+#
+# Writes to a temp file next to the original and renames, so a full disk or a
+# killed script cannot leave a half-written pvedaemon behind.
+insert_line() {
+    local file="$1" anchor="$2" line="$3" where="$4"
+    local tmp
+    tmp="$(mktemp "${file}.pveum.XXXXXX")"
+
+    awk -v anchor="$anchor" -v line="$line" -v where="$where" '
+        !done && where == "before" && $0 ~ anchor { print line; done = 1 }
+        { print }
+        !done && where == "after" && $0 ~ anchor { print line; done = 1 }
+        END { if (!done) exit 3 }
+    ' "$file" > "$tmp" || {
+        rm -f "$tmp"
+        warn "anchor not found in $file - refusing to guess where the line goes"
+        return 1
+    }
+
+    chmod --reference="$file" "$tmp"
+    mv "$tmp" "$file"
+}
+
+remove_hook_line() {
+    local file="$1"
+    local tmp
+    tmp="$(mktemp "${file}.pveum.XXXXXX")"
+
+    # -F -x for the same reason has_hook uses them: only the line we put there
+    # comes out, never a line that happens to mention the name.
+    if [ "$file" = "$TPL" ]; then
+        grep -Fv -- "$TPL_TAG_MATCH" "$file" > "$tmp" || true
+    else
+        grep -Fvx -- "$PERL_LINE" "$file" > "$tmp" || true
+    fi
+
+    # An empty result means grep failed rather than filtered - writing that over
+    # pvedaemon would be the one mistake this script must never make.
+    if [ ! -s "$tmp" ]; then
+        rm -f "$tmp"
+        warn "refusing to write an empty $file"
+        return 1
+    fi
+
+    chmod --reference="$file" "$tmp"
+    mv "$tmp" "$file"
+}
+
+save_backup() {
+    local file="$1"
+    mkdir -p "$BACKUP_DIR"
+    cp -a "$file" "$(backup_of "$file")"
+}
+
+restore_backup() {
+    local file="$1"
+    local bak
+    bak="$(backup_of "$file")"
+    [ -f "$bak" ] || return 1
+    cp -a "$bak" "$file"
+}
+
+# Which of the two lines belongs in this file.
+hook_line_for() {
+    local file="$1"
+
+    if [ "$file" = "$TPL" ]; then
+        tpl_line
+    else
+        echo "$PERL_LINE"
+    fi
+}
+
+# Matches the WHOLE inserted line (-F -x), not the marker anywhere in the file.
+#
+# Searching for the bare marker was wrong twice over. A file that merely mentions
+# the string somewhere - a path like /opt/pve-update-manager/..., say - counted as
+# already hooked, so apply silently did nothing; and revert deleted that innocent
+# line along with ours. Both were seen for real: after the repository was renamed
+# to pve-update-manager, the CI checkout path contained the marker and the test
+# fixtures started failing exactly that way.
+# Is OUR tag/line in this file - whatever version the tag carries?
+#
+# The template is matched on the path to our file rather than on the whole line,
+# because the line now ends in a version that legitimately changes. The Perl
+# files keep whole-line matching, which is what stopped a stray mention of the
+# package name from counting as a hook.
+has_hook() {
+    local file="$1"
+
+    if [ "$file" = "$TPL" ]; then
+        grep -Fq -- "$TPL_TAG_MATCH" "$file" 2>/dev/null
+    else
+        grep -Fqx -- "$PERL_LINE" "$file" 2>/dev/null
+    fi
+}
+
+# Is the tag in this file the one we would write right now?
+has_current_hook() {
+    local file="$1"
+
+    grep -Fq -- "$(hook_line_for "$file")" "$file" 2>/dev/null
+}
+
+apply_tpl() {
+    [ -f "$TPL" ] || { warn "$TPL not found - is pve-manager installed?"; return 1; }
+
+    if has_current_hook "$TPL"; then
+        msg "web interface hook already in place"
+        return 0
+    fi
+
+    if has_hook "$TPL"; then
+        # Our tag is there but names an older version of the file. Replace it, so
+        # the browser is told to fetch the interface again instead of running
+        # yesterday's against today's API. No backup here: the pristine copy was
+        # taken when the tag was first added.
+        remove_hook_line "$TPL" || return 1
+        insert_line "$TPL" "$TPL_ANCHOR" "$(tpl_line)" after || return 1
+        msg "web interface hook updated in $TPL"
+        return 0
+    fi
+
+    save_backup "$TPL"
+    # Explicit `|| return`: cmd_apply calls this in an `||` list, and inside such
+    # a call `set -e` is suspended - a bare failing command would be walked past
+    # and the function would report success.
+    insert_line "$TPL" "$TPL_ANCHOR" "$(tpl_line)" after || return 1
+    msg "web interface hook added to $TPL"
+}
+
+apply_perl_target() {
+    local file="$1"
+    [ -f "$file" ] || { warn "$file not found - is pve-manager installed?"; return 1; }
+
+    if has_hook "$file"; then
+        msg "API hook already in place in $file"
+        return 0
+    fi
+
+    save_backup "$file"
+    # BEFORE the entry-point module: BEGIN blocks run in textual order, so this
+    # is what makes the routes exist by the time that module is imported. The
+    # daemons do not care either way, so one rule covers all three.
+    insert_line "$file" "$PERL_ANCHOR" "$PERL_LINE" before || return 1
+
+    # -T because pvedaemon and pveproxy carry -T on the shebang and perl refuses
+    # to compile-check them without it. pvesh does not, and does not mind: -T on
+    # the command line is always allowed.
+    if ! perl -Tc "$file" >/dev/null 2>&1; then
+        warn "patched $file does not compile - restoring the original"
+        restore_backup "$file"
+        return 1
+    fi
+
+    msg "API hook added to $file"
+}
+
+reload_services() {
+    local svc
+    for svc in pvedaemon pveproxy; do
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            # reload: both daemons re-exec themselves on reload, which is how new
+            # Perl code gets picked up without dropping the web session.
+            systemctl reload-or-restart "$svc" >/dev/null 2>&1 \
+                || warn "could not reload $svc - run 'systemctl restart $svc' by hand"
+        fi
+    done
+}
+
+cmd_apply() {
+    local rc=0
+
+    apply_tpl || rc=1
+    for d in "${PERL_TARGETS[@]}"; do
+        apply_perl_target "$d" || rc=1
+    done
+
+    reload_services
+
+    if [ "$rc" != "0" ]; then
+        warn "not every hook could be applied - see the messages above"
+    else
+        msg "pve-update-manager is hooked in"
+    fi
+
+    return "$rc"
+}
+
+cmd_revert() {
+    local f
+    for f in "$TPL" "${PERL_TARGETS[@]}"; do
+        [ -f "$f" ] || continue
+        has_hook "$f" || continue
+
+        remove_hook_line "$f"
+
+        case "$f" in
+            /usr/bin/*)
+                if ! perl -Tc "$f" >/dev/null 2>&1; then
+                    warn "$f does not compile after removing the hook - restoring the backup"
+                    restore_backup "$f" || warn "no backup for $f, fix it by hand"
+                fi
+                ;;
+        esac
+
+        msg "hook removed from $f"
+    done
+
+    reload_services
+}
+
+cmd_status() {
+    local f rc=0
+    for f in "$TPL" "${PERL_TARGETS[@]}"; do
+        if [ ! -f "$f" ]; then
+            echo "missing  $f"
+            rc=1
+        elif has_hook "$f"; then
+            echo "hooked   $f"
+        else
+            echo "plain    $f"
+            rc=1
+        fi
+    done
+    return "$rc"
+}
+
+main() {
+    local cmd=''
+
+    for arg in "$@"; do
+        case "$arg" in
+            --quiet) QUIET=1 ;;
+            apply | revert | status) cmd="$arg" ;;
+            *) echo "usage: $0 {apply|revert|status} [--quiet]" >&2; exit 2 ;;
+        esac
+    done
+
+    case "$cmd" in
+        apply) cmd_apply ;;
+        revert) cmd_revert ;;
+        status) cmd_status ;;
+        *) echo "usage: $0 {apply|revert|status} [--quiet]" >&2; exit 2 ;;
+    esac
+}
+
+main "$@"

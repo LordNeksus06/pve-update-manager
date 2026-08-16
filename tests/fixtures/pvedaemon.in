@@ -1,0 +1,37 @@
+#!/usr/bin/perl -T
+# Fixture: the head of a real /usr/bin/pvedaemon, verbatim apart from the
+# `use lib` line the test suite fills in.
+#
+# It has to be a REAL taint-mode Perl script, because what is being tested is
+# that the hook script's `perl -Tc` check passes after the require line is
+# inserted - and taint mode ignores PERL5LIB, so the stubs have to come in
+# through `use lib`.
+
+$ENV{'PATH'} = '/sbin:/bin:/usr/sbin:/usr/bin';
+
+delete @ENV{qw(IFS CDPATH ENV BASH_ENV)};
+
+# A stray mention of pve-update-manager that has nothing to do with the hook.
+# Detection must match the whole inserted line, not this.
+use strict;
+use warnings;
+
+use lib '@STUBS@';
+
+use PVE::SafeSyslog;
+use PVE::Service::pvedaemon;
+
+$SIG{'__WARN__'} = sub {
+    my $err = $@;
+    my $t = $_[0];
+    chomp $t;
+    print STDERR "$t\n";
+    syslog('warning', "%s", $t);
+    $@ = $err;
+};
+
+my $prepare = sub {
+    mkdir "/var/run/dtach";
+};
+
+PVE::Service::pvedaemon->run_cli_handler(prepare => $prepare);

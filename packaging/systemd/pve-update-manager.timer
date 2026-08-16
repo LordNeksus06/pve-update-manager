@@ -1,0 +1,16 @@
+[Unit]
+Description=Ask pve-update-manager whether a scheduled update is due
+
+[Timer]
+# The interval the user configures is NOT encoded here - this only asks, and
+# pve-update-manager-schedule decides. That keeps a changed interval effective
+# immediately instead of needing this file rewritten and systemd reloaded.
+OnBootSec=5min
+OnUnitActiveSec=5min
+# Not Persistent=: a node that was off does not need to catch up on every tick it
+# missed, it needs one run once it is back and the interval has elapsed - which
+# is exactly what the last_run stamp already decides.
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,4 @@
+# pve-manager owns all three files this addon edits (index.html.tpl, pvedaemon,
+# pveproxy) and ships them under /usr/share/pve-manager as well, so an upgrade
+# of that package activates this trigger - and the postinst puts the lines back.
+interest-noawait /usr/share/pve-manager

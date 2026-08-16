@@ -1,0 +1,61 @@
+#!/bin/sh
+# Hook the addon into pve-manager - on install, and again after every
+# pve-manager upgrade (the dpkg trigger on /usr/share/pve-manager brings us
+# here with "$1" = triggered).
+set -e
+
+HOOKS=/usr/sbin/pve-update-manager-hooks
+
+case "$1" in
+    configure)
+        # A fresh install that cannot hook itself in has produced nothing, so it
+        # is worth a failed configure: the admin sees it now instead of hunting
+        # for a tab that never appears.
+        "$HOOKS" apply
+
+        # The timer only ASKS whether a run is due; with no schedule configured
+        # it exits immediately. Enabling it here means a schedule set in the web
+        # interface starts working without anyone touching systemctl.
+        #
+        # deb-systemd-helper rather than `systemctl enable`: it records that the
+        # unit was enabled by the package and, crucially, remembers a later
+        # `systemctl disable`. Plain `systemctl enable` in configure runs on
+        # UPGRADES too and would quietly switch the timer back on for an admin
+        # who had turned it off.
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+
+            if command -v deb-systemd-helper >/dev/null 2>&1; then
+                deb-systemd-helper unmask pve-update-manager.timer >/dev/null 2>&1 || true
+                if deb-systemd-helper --quiet was-enabled pve-update-manager.timer; then
+                    deb-systemd-helper enable pve-update-manager.timer >/dev/null 2>&1 || true
+                else
+                    deb-systemd-helper update-state pve-update-manager.timer >/dev/null 2>&1 || true
+                fi
+            elif [ -z "$2" ]; then
+                # First install only - see above.
+                systemctl enable pve-update-manager.timer >/dev/null 2>&1 || true
+            fi
+
+            if command -v deb-systemd-invoke >/dev/null 2>&1; then
+                deb-systemd-invoke start pve-update-manager.timer >/dev/null 2>&1 || true
+            else
+                systemctl start pve-update-manager.timer >/dev/null 2>&1 || true
+            fi
+        fi
+        ;;
+
+    triggered)
+        # Mid-upgrade. A failure here must not abort somebody else's apt run;
+        # the hook script has already restored what it touched, so warn and let
+        # the run finish.
+        if ! "$HOOKS" apply; then
+            echo "pve-update-manager: could not re-apply the hooks after a pve-manager upgrade." >&2
+            echo "pve-update-manager: run '$HOOKS apply' to retry." >&2
+        fi
+        ;;
+
+    abort-upgrade | abort-remove | abort-deconfigure) ;;
+esac
+
+exit 0

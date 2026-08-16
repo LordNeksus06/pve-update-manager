@@ -1,0 +1,18 @@
+#!/usr/bin/perl
+# Fixture: the head of a real /usr/bin/pvesh, verbatim apart from the `use lib`
+# line the test suite fills in.
+#
+# Deliberately NOT a taint-mode script - the real pvesh has no -T on its shebang
+# while pvedaemon and pveproxy do, and the hook script has to hook both kinds
+# and compile-check both kinds.
+
+# A stray mention of pve-update-manager that has nothing to do with the hook.
+# Detection must match the whole inserted line, not this.
+use strict;
+use warnings;
+
+use lib '@STUBS@';
+
+use PVE::CLI::pvesh;
+
+PVE::CLI::pvesh->run_cli_handler();

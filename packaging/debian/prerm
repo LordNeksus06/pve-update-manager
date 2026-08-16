@@ -1,0 +1,36 @@
+#!/bin/sh
+# Take the addon back out of pve-manager's files before ours disappear.
+#
+# Only on remove/deconfigure: during an upgrade the new postinst puts the hooks
+# straight back, and reverting in between would restart pvedaemon twice for
+# nothing.
+set -e
+
+HOOKS=/usr/sbin/pve-update-manager-hooks
+
+case "$1" in
+    remove | deconfigure)
+        # Stop it, do NOT disable it. `systemctl disable` here removes the
+        # symlink behind deb-systemd-helper's back, and on the next install its
+        # was-enabled check reads that missing symlink as "the admin turned this
+        # off" - so the timer stays off for ever and scheduled updates silently
+        # never run again. Measured: purge, reinstall, timer inactive and
+        # disabled. Disabling on removal is postrm's job, through the helper
+        # that keeps the books.
+        if [ -d /run/systemd/system ]; then
+            if command -v deb-systemd-invoke >/dev/null 2>&1; then
+                deb-systemd-invoke stop pve-update-manager.timer >/dev/null 2>&1 || true
+            else
+                systemctl stop pve-update-manager.timer >/dev/null 2>&1 || true
+            fi
+        fi
+
+        if [ -x "$HOOKS" ]; then
+            "$HOOKS" revert || echo "pve-update-manager: revert failed, check '$HOOKS status'" >&2
+        fi
+        ;;
+
+    upgrade | failed-upgrade) ;;
+esac
+
+exit 0

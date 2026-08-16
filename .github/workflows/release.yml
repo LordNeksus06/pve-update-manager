@@ -1,0 +1,208 @@
+name: Build, Test & Release
+
+# The GitHub half of a repository that lives on two forges.
+#
+# Gitea reads .gitea/workflows/, GitHub reads .github/workflows/, and each one
+# has its own release API - which is the whole reason there are two files rather
+# than one clever one.
+#
+# Every job here is gated on the server actually being github.com. Gitea also
+# picks up .github/workflows as a fallback, so without that gate a push to the
+# internal remote would run BOTH pipelines and cut two releases for one commit.
+# GitHub never sees .gitea/workflows, so the other file needs no such guard.
+#
+# Two branches, two kinds of release: a push to main publishes a prerelease, a
+# push to release publishes a stable one. Same pipeline and same tests either
+# way - a stable release that ran different checks than the prereleases before
+# it would be a stable release nobody has actually tested.
+#
+# One thing this pipeline deliberately does NOT do, because GitHub cannot: the
+# Gitea side also uploads the .deb into a Debian package registry, which is what
+# makes `apt install pve-update-manager` work against that server. GitHub
+# Packages has no apt repository format, so on this side the .deb is a release
+# asset to download and install by hand. Everything else - the checks, the
+# package, the source tarball, the changelog, stable vs prerelease - is the
+# same on both.
+
+on:
+  push:
+    branches: [ main, release ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: write
+
+jobs:
+  # ── Static checks and the test suite ────────────────────────────────────────
+  #
+  # No Proxmox on a GitHub runner, and none is needed: the Perl modules compile
+  # and run against the stubs in tests/stubs, and the hook script is exercised
+  # for real against copies of a real index.html.tpl and a real taint-mode
+  # pvedaemon.
+  test:
+    if: startsWith(github.server_url, 'https://github.com')
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install deps
+      run: |
+        set -euo pipefail
+        sudo apt-get update -qq
+        # nodejs for `node --check` on the UI file and for the interface tests,
+        # which load it into a V8 context - there is no build step for the
+        # JavaScript, it ships as written.
+        sudo apt-get install -y --no-install-recommends \
+          make shellcheck perl nodejs dpkg-dev
+
+    - name: make check (shellcheck, perl -c, node --check)
+      run: make check
+
+    - name: make test (unit tests + hook script against fixtures)
+      run: make test
+
+    - name: Assert the addon never patches pvemanagerlib.js
+      run: |
+        set -euo pipefail
+        # The whole point of the ExtJS override is that Proxmox' own bundle stays
+        # untouched. What has to be true is that the script only ever SEARCHES
+        # for that name and never writes to it - so that is what is checked:
+        # outside comments the bundle may be named exactly once, and only as the
+        # anchor.
+        code=$(grep -vE '^[[:space:]]*#' tools/pve-update-manager-hooks | grep 'pvemanagerlib' || true)
+        expected="TPL_ANCHOR='pvemanagerlib\\.js'"
+
+        if [ "$code" != "$expected" ]; then
+          echo "FATAL: pvemanagerlib.js is used for something other than the anchor"
+          echo "expected exactly one line of code:"
+          echo "  $expected"
+          exit 1
+        fi
+        echo "pvemanagerlib.js is only ever searched for, never written to"
+
+    - name: Build the .deb (proves packaging works before a release is drafted)
+      run: |
+        set -euo pipefail
+        bash packaging/build-deb.sh 0.0.0-ci
+        # A package that installs the UI file anywhere but the directory pveproxy
+        # serves as /pve2/js/ would install fine and then do nothing.
+        dpkg-deb --contents deb-out/*.deb \
+          | grep -q './usr/share/pve-manager/js/pve-update-manager.js' \
+          || { echo "FATAL: the UI file is not where pveproxy serves it from"; exit 1; }
+        # The maintainer scripts and the trigger are what re-apply the hooks
+        # after a pve-manager upgrade - a package without them dies at the next
+        # apt run.
+        for f in postinst prerm postrm triggers; do
+          dpkg-deb --ctrl-tarfile deb-out/*.deb | tar -t | grep -q "^./$f$" \
+            || { echo "FATAL: $f missing from the package"; exit 1; }
+        done
+        # Architecture: all is what makes one artifact serve every port of
+        # Proxmox VE, arm64 included. A wrong-arch package is not offered by apt
+        # rather than failing loudly, so this would break silently.
+        arch=$(dpkg-deb -f deb-out/*.deb Architecture)
+        [ "$arch" = "all" ] || {
+          echo "FATAL: package architecture is '$arch', expected 'all'"
+          exit 1
+        }
+        echo "deb OK (Architecture: all - installs on every Proxmox VE arch)"
+
+  # ── Release ────────────────────────────────────────────────────────────────
+  #
+  # `gh` rather than a third-party release action: it is preinstalled on the
+  # runner and it is one less repository with write access to this one.
+  release:
+    needs: [test]
+    # success() is REQUIRED: a custom `if:` replaces the implicit success() gate
+    # that `needs` would otherwise apply, so without it a FAILED test job would
+    # not stop the release.
+    if: success() && github.event_name == 'push' && startsWith(github.server_url, 'https://github.com')
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        # version.sh counts commits since VERSION last changed, so a shallow
+        # clone would produce a wrong - and non-monotonic - package version.
+        fetch-depth: 0
+
+    - name: Install deps
+      run: |
+        set -euo pipefail
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends make dpkg-dev
+
+    - name: Build the release artifacts
+      id: build
+      run: |
+        set -euo pipefail
+        VERSION="$(bash version.sh)"
+        echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+        echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+        bash packaging/build-deb.sh "$VERSION"
+        git archive --format=tar.gz --prefix="pve-update-manager-$VERSION/" \
+          -o "deb-out/pve-update-manager-$VERSION.tar.gz" HEAD
+
+    - name: Publish the release
+      env:
+        GH_TOKEN: ${{ github.token }}
+        VERSION: ${{ steps.build.outputs.version }}
+        TAG: ${{ steps.build.outputs.tag }}
+        REF_NAME: ${{ github.ref_name }}
+      run: |
+        set -euo pipefail
+
+        # The branch decides, and nothing else does.
+        if [ "$REF_NAME" = "release" ]; then
+          PRERELEASE_FLAG=""
+          echo ":: branch '$REF_NAME' — publishing as a STABLE release"
+        else
+          PRERELEASE_FLAG="--prerelease"
+          echo ":: branch '$REF_NAME' — publishing as a prerelease"
+        fi
+
+        # Idempotent: re-running a workflow must not fail on a tag that already
+        # exists, and must not quietly ship a second release for one commit.
+        if gh release view "$TAG" >/dev/null 2>&1; then
+          echo "release $TAG already exists, nothing to do"
+          exit 0
+        fi
+
+        # The same changelog the Gitea side produces: everything since the last
+        # tag, or the last 50 commits if this is the first release. A release
+        # whose notes do not say what changed is a release nobody can decide
+        # whether to take.
+        LAST_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)
+        if [ -n "$LAST_TAG" ]; then
+          CHANGES=$(git log "${LAST_TAG}..HEAD" --no-merges --pretty=format:"- %s (%h)")
+        else
+          CHANGES=$(git log --no-merges --pretty=format:"- %s (%h)" -n 50)
+        fi
+
+        {
+          echo "## pve-update-manager $VERSION"
+          echo
+          echo "An Update Manager tab for Proxmox VE containers and nodes."
+          echo
+          echo '### Install'
+          echo
+          echo '```sh'
+          echo "sudo apt install ./pve-update-manager_${VERSION}_all.deb"
+          echo '```'
+          echo
+          echo 'Then reload the web interface.'
+          echo
+          echo 'The package is `Architecture: all` - the same file installs on'
+          echo 'amd64 and on the arm64 port of Proxmox VE.'
+          echo
+          echo '### Changes'
+          echo
+          echo "$CHANGES"
+        } > notes.md
+
+        # shellcheck disable=SC2086  # PRERELEASE_FLAG is one optional flag
+        gh release create "$TAG" $PRERELEASE_FLAG \
+          --title "pve-update-manager $VERSION" \
+          --notes-file notes.md \
+          deb-out/*.deb \
+          "deb-out/pve-update-manager-$VERSION.tar.gz"

@@ -1,0 +1,39 @@
+#!/bin/sh
+# On purge, take the stored update scripts with us.
+#
+# They live in /etc/pve, so this removes them on every node of the cluster at
+# once - which is what purge means, and why plain `remove` leaves them alone.
+set -e
+
+case "$1" in
+    purge)
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
+
+        # Drops the helper's record of the timer as well, so a later install
+        # starts from a clean slate rather than inheriting a state that says the
+        # unit is disabled. unmask undoes the mask below.
+        if command -v deb-systemd-helper >/dev/null 2>&1; then
+            deb-systemd-helper purge pve-update-manager.timer >/dev/null 2>&1 || true
+            deb-systemd-helper unmask pve-update-manager.timer >/dev/null 2>&1 || true
+        fi
+
+        rm -rf /var/lib/pve-update-manager
+        rm -rf /etc/pve/pve-update-manager
+        ;;
+
+    remove)
+        # Masked rather than disabled: the unit file is about to disappear and
+        # nothing should try to start it in the meantime, but the helper's
+        # record of "this was enabled" has to survive so that reinstalling
+        # brings the timer back. postinst unmasks.
+        if command -v deb-systemd-helper >/dev/null 2>&1; then
+            deb-systemd-helper mask pve-update-manager.timer >/dev/null 2>&1 || true
+        fi
+        ;;
+
+    upgrade | failed-upgrade | abort-install | abort-upgrade | disappear) ;;
+esac
+
+exit 0

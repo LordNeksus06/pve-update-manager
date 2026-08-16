@@ -1,0 +1,19 @@
+[Unit]
+Description=pve-update-manager scheduled updates
+ConditionPathExists=/usr/sbin/pve-update-manager-schedule
+# The schedule and the update scripts live in /etc/pve, which is only there once
+# the cluster filesystem is mounted.
+After=pve-cluster.service
+Wants=pve-cluster.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/pve-update-manager-schedule run
+
+# The scheduler forks Proxmox worker tasks and returns at once - a dist-upgrade
+# must not hold this oneshot service open. But with the default
+# KillMode=control-group systemd tears down everything left in the cgroup the
+# moment the main process exits, which killed those workers within a second of
+# starting them. Only the main process is ours to kill; the workers belong to
+# Proxmox' task machinery and end on their own.
+KillMode=process

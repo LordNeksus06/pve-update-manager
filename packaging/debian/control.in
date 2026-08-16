@@ -1,0 +1,30 @@
+Package: pve-update-manager
+Version: @VERSION@
+Section: admin
+Priority: optional
+Architecture: all
+Maintainer: pve-update-manager <pve-update-manager@localhost>
+License: AGPL-3+
+Depends: pve-manager (>= 9.0), pve-container, libpve-common-perl, perl
+Description: Update Manager tab for Proxmox VE containers and nodes
+ Adds an "Update Manager" tab to every LXC container, to every node and to the
+ datacenter in the Proxmox VE web interface.
+ .
+ The container tab is a text box: the update commands for that container are
+ written by hand, stored under /etc/pve/pve-update-manager/, and run inside the
+ container by pressing Update. Nothing is generated.
+ .
+ The node and datacenter tabs list the hosts and every container. Tick the ones
+ that should be updated and they all start at once, each in its own Proxmox
+ task, with its own log and its own recorded state - which the row then shows.
+ The datacenter tab spans the whole cluster, so several servers update at the
+ same time.
+ .
+ A node can also run its updates on a timer: the Schedule window sets the
+ interval, which targets are included, and whether they run at the same time or
+ one after another (one after another by default).
+ .
+ The integration is four one-line edits to files owned by pve-manager (a script
+ tag in index.html.tpl and a require in pvedaemon, pveproxy and pvesh). They are
+ re-applied automatically after a pve-manager upgrade by a dpkg trigger, and
+ removed again when this package is.
