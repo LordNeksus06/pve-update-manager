@@ -82,6 +82,16 @@ echo
 # would have caught `.gitea/` and CLAUDE.md going to GitHub.
 check "the mirror knows what may be published" bash "$REPO_ROOT/tools/github-mirror.sh" check
 
+# And the scans it refuses on: a scanner nobody has watched fail is a scanner
+# nobody knows the shape of. Its own fixtures, its own verdict.
+if out="$(bash "$REPO_ROOT/tools/github-mirror.sh" selftest 2>&1)"; then
+    ok "the mirror catches addresses and credentials before publishing"
+else
+    bad "the mirror catches addresses and credentials before publishing"
+    # shellcheck disable=SC2001  # indenting every line of a captured block
+    echo "$out" | sed 's/^/       /'
+fi
+
 echo "== web interface"
 for t in tests/js/*.test.js; do
     if out="$(node "$t" 2>&1)"; then

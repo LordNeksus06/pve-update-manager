@@ -2,6 +2,7 @@
 # Fills the public GitHub mirror from this repository.
 #
 #   tools/github-mirror.sh check          only verify the file lists (used by the test suite)
+#   tools/github-mirror.sh selftest       run the leak and credential scans against fixtures
 #   tools/github-mirror.sh sync [DIR]     sync + commit into the mirror at DIR
 #
 # Why a mirror and not a push:
@@ -100,7 +101,7 @@ check_lists() {
 leak_scan() {
     local dir="$1" hits
     hits="$(grep -rIEn '192\.168\.|(^|[^0-9.])10\.[0-9]+\.[0-9]+\.[0-9]+|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' "$dir" \
-        --exclude-dir=.git 2>/dev/null \
+        --exclude-dir=.git --exclude=github-mirror.sh 2>/dev/null \
         | grep -vE 'noreply@anthropic\.com|jilkelukas@gmail\.com|example\.(com|org)|@[A-Za-z0-9.-]*\{|\$\{' || true)"
 
     [ -z "$hits" ] && return 0
@@ -108,6 +109,103 @@ leak_scan() {
     echo "github-mirror: refusing to publish - possible personal data:" >&2
     echo "$hits" | head -20 >&2
     return 1
+}
+
+# Both scanners skip THIS file by name. Its fixtures are deliberately the very
+# things being searched for, so scanning it would refuse every sync for ever -
+# and a scanner that has to be switched off to work gets switched off. The
+# fixtures use addresses that belong to nobody; a real one has no business in a
+# tracked file in the first place.
+#
+# Credentials. A token in a public commit is a token that has to be rotated, and
+# nobody finds out from the diff - they find out from the abuse.
+#
+# Two kinds of pattern, because they fail differently:
+#
+#   shaped     things that ARE a credential wherever they appear - a private key
+#              header, a Proxmox API token, a GitHub PAT, an AWS key id. No
+#              context needed and no false positives to speak of.
+#   assigned   `password=`, `token:`, `secret =` with a literal value behind it.
+#              This is where real leaks look ordinary, so the value has to be
+#              inspected rather than the key word: a reference like $GITEA_TOKEN
+#              or ${{ secrets.X }} is the correct way to write it and must not
+#              cost a refusal, or the check gets switched off.
+SECRET_SHAPED='-----BEGIN [A-Z ]*PRIVATE KEY-----|PVE:[A-Za-z0-9@!.-]+:[A-F0-9]{8}::|PVEAPIToken=|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}'
+SECRET_ASSIGNED='(pass(wor)?d|passphrase|secret|api[_-]?key|token|credential)[[:space:]]*[:=][[:space:]]*'
+
+secret_scan() {
+    local dir="$1" hits assigned
+
+    # -e, because the pattern starts with a dash: without it grep reads
+    # "-----BEGIN ..." as options, fails, and the `|| true` turns that into a
+    # clean bill of health. Found by the selftest below, which is the point of
+    # having one.
+    hits="$(grep -rIEn -e "$SECRET_SHAPED" "$dir" --exclude-dir=.git --exclude=github-mirror.sh 2>/dev/null || true)"
+
+    # An assignment counts only when what follows is a literal long enough to be
+    # a secret: not a variable, not a placeholder, not an empty default.
+    assigned="$(grep -rIEni "${SECRET_ASSIGNED}[\"'\`]?[A-Za-z0-9+/=_.-]{8,}" "$dir" --exclude-dir=.git --exclude=github-mirror.sh 2>/dev/null \
+        | grep -viE "${SECRET_ASSIGNED}[\"'\`]?(\\\$|%|<|\{\{|xxx|yyy|changeme|your|example|placeholder|redacted|null|none|true|false)" \
+        | grep -vE '\$\{|\$\(|\$[A-Za-z_]' || true)"
+
+    hits="$(printf '%s\n%s\n' "$hits" "$assigned" | grep -v '^$' || true)"
+
+    [ -z "$hits" ] && return 0
+
+    echo "github-mirror: refusing to publish - possible credentials:" >&2
+    echo "$hits" | head -20 >&2
+    echo "If one of these is a false positive, tighten the pattern - do not skip the scan." >&2
+    return 1
+}
+
+# Both scanners against known-bad and known-good text, because a scanner nobody
+# has seen fail is a scanner nobody knows the shape of. Run by `make test`.
+# shellcheck disable=SC2016  # the fixtures are literal text, not shell to expand
+selftest() {
+    local tmp rc=0
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' RETURN
+
+    must_catch() {
+        local name="$1" content="$2"
+        printf '%s\n' "$content" > "$tmp/candidate"
+        if leak_scan "$tmp" >/dev/null 2>&1 && secret_scan "$tmp" >/dev/null 2>&1; then
+            echo "  FAIL the scan lets through: $name" >&2
+            rc=1
+        else
+            echo "  ok   caught: $name"
+        fi
+        rm -f "$tmp/candidate"
+    }
+
+    must_pass() {
+        local name="$1" content="$2"
+        printf '%s\n' "$content" > "$tmp/candidate"
+        if leak_scan "$tmp" >/dev/null 2>&1 && secret_scan "$tmp" >/dev/null 2>&1; then
+            echo "  ok   allowed: $name"
+        else
+            echo "  FAIL the scan refuses: $name" >&2
+            rc=1
+        fi
+        rm -f "$tmp/candidate"
+    }
+
+    must_catch "a private key header" "-----BEGIN OPENSSH PRIVATE KEY-----"
+    must_catch "a Proxmox ticket" 'PVE:root@pam:68A1B2C3::abcdef'
+    must_catch "a Proxmox API token" 'PVEAPIToken=root@pam!ci=6f1e2d3c-4b5a'
+    must_catch "a GitHub token" 'github_pat_11ABCDEFG0abcdefghijklmnop'
+    must_catch "a password with a value" 'password = "hunter2hunter2"'
+    must_catch "a token with a value" 'GITEA_TOKEN: 9f8e7d6c5b4a39281706fedcba'
+    must_catch "a private host address" 'connect to 10.20.30.40:3000'
+    must_catch "somebody's mail address" 'reported by tester@somewhere.net'
+
+    must_pass "a token read from the environment" 'curl -H "Authorization: token $GITEA_TOKEN"'
+    must_pass "a workflow secret reference" 'GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}'
+    must_pass "the maintainer address" 'Maintainer: pve-update-manager <jilkelukas@gmail.com>'
+    must_pass "prose about passwords" 'The password is never stored on disk.'
+    must_pass "an empty default" 'token = ""'
+
+    return $rc
 }
 
 sync_mirror() {
@@ -158,6 +256,7 @@ EOF
     chmod 0755 "$staging/version.sh"
 
     leak_scan "$staging" || exit 1
+    secret_scan "$staging" || exit 1
 
     # Replace, do not merge: a file deleted here has to disappear there too.
     find "$mirror" -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
@@ -183,6 +282,7 @@ EOF
 
 case "${1:-}" in
     check) check_lists ;;
+    selftest) selftest ;;
     sync) shift; sync_mirror "${1:-}" ;;
-    *) die "usage: $0 check | sync [MIRROR_DIR]" ;;
+    *) die "usage: $0 check | selftest | sync [MIRROR_DIR]" ;;
 esac
