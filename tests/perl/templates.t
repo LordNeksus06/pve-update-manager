@@ -10,7 +10,7 @@ use strict;
 use warnings;
 
 use File::Temp qw(tempdir);
-use Test::More tests => 63;
+use Test::More tests => 66;
 
 use PVE::Tools;
 use PVE::UpdateManager::Config;
@@ -64,6 +64,16 @@ sub script_of {
     like($apt, qr/^export DEBIAN_FRONTEND=noninteractive$/m, 'it answers debconf questions');
     like($apt, qr/\A\#\!/, 'it starts with a shebang, which is what picks the interpreter');
     like($apt, qr/--force-confold/, 'and keeps the config files that are already on the box');
+    like(
+        $apt,
+        qr/^apt-get update \$RELEASEINFO$/m,
+        'and lets apt through a repository that renamed its suite or codename',
+    );
+    like(
+        $apt,
+        qr/dpkg --compare-versions .* ge 1\.9/,
+        'but only where apt is new enough to know the option',
+    );
 
     my $major = script_of($defaults, 'Debian / Ubuntu - major release upgrade');
     ok(defined($major), 'there is a template for a major release upgrade');
@@ -88,6 +98,11 @@ sub script_of {
         'and does the minimal upgrade before the full one, as the release notes prescribe',
     );
     like($major, qr/TARGET_RELEASE=/, 'the release to go to is named, not guessed');
+    is(
+        scalar(() = $major =~ m/^\s*apt-get update \$RELEASEINFO$/mg),
+        2,
+        'the major upgrade passes it to both of its updates - the codename rewrite needs it',
+    );
     like($major, qr/MAJOR RELEASE UPGRADE/, 'and the box says what it is before it says how');
 
     for my $tpl (@$defaults) {

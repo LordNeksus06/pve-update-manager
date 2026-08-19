@@ -143,6 +143,9 @@ Good to know:
 - Reset is `POST templates/reset`, not a `DELETE` with the name left off.
 - Once you edit one entry, improved defaults for the others stop arriving until
   you reset.
+- Both apt templates pass `--allow-releaseinfo-change` to `apt-get update`, so a
+  repository that renamed its suite or codename does not stop the run. It is
+  only passed where apt is 1.9 or newer, which is where the option exists.
 - The **major release upgrade** template handles both distributions: Ubuntu via
   `do-release-upgrade`, Debian by rewriting the codename in `sources.list` and
   in deb822 `.sources`, then minimal-then-full upgrade. The target release is a

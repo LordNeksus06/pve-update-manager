@@ -44,7 +44,16 @@ set -e
 # noninteractive answers every debconf question with its default.
 export DEBIAN_FRONTEND=noninteractive
 
-apt-get update
+# --allow-releaseinfo-change lets apt accept a repository that renamed its
+# suite, codename or origin instead of stopping with an error. It arrived in
+# apt 1.9 (Debian buster, Ubuntu 19.10) and older versions reject the option,
+# so it is only passed where it exists. `apt-get --help` does not list it.
+RELEASEINFO=
+if dpkg --compare-versions "$(dpkg-query -f '${Version}' -W apt 2>/dev/null || echo 0)" ge 1.9; then
+    RELEASEINFO=--allow-releaseinfo-change
+fi
+
+apt-get update $RELEASEINFO
 apt-get -y -o Dpkg::Options::=--force-confold dist-upgrade
 apt-get -y --purge autoremove
 apt-get clean
@@ -70,9 +79,18 @@ TARGET_RELEASE=trixie
 
 . /etc/os-release
 
+# --allow-releaseinfo-change lets apt accept a repository that renamed its
+# suite, codename or origin instead of stopping with an error. It arrived in
+# apt 1.9 (Debian buster, Ubuntu 19.10) and older versions reject the option,
+# so it is only passed where it exists. `apt-get --help` does not list it.
+RELEASEINFO=
+if dpkg --compare-versions "$(dpkg-query -f '${Version}' -W apt 2>/dev/null || echo 0)" ge 1.9; then
+    RELEASEINFO=--allow-releaseinfo-change
+fi
+
 # A release upgrade that starts from a half-patched system finishes as a
 # half-upgraded one. Bring the CURRENT release fully up to date first.
-apt-get update
+apt-get update $RELEASEINFO
 apt-get -y -o Dpkg::Options::=--force-confold dist-upgrade
 apt-get -y --purge autoremove
 
@@ -119,7 +137,7 @@ debian)
         sed -i "s/\b$VERSION_CODENAME\b/$TARGET_RELEASE/g" "$f"
     done
 
-    apt-get update
+    apt-get update $RELEASEINFO
     # The two steps the Debian release notes prescribe: the minimal upgrade
     # first, so the packages that have to move before anything else do, then
     # the rest.
