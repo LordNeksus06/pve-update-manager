@@ -5,4 +5,4 @@
 # version as the one built from the source repository. Do not edit by hand -
 # tools/github-mirror.sh rewrites it on every sync.
 set -euo pipefail
-echo "1.0.52"
+echo "1.0.53"

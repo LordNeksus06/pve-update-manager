@@ -50,6 +50,10 @@ sub remove_lock {
     my ($class, $vmid, $lock) = @_;
 
     die "no lock to remove\n" if !$LOCKS{$vmid};
+    # The real one refuses to remove a lock that is not the one asked for, which
+    # is what keeps a repair from taking somebody else's lock off.
+    die "found lock '$LOCKS{$vmid}' trying to remove '$lock' lock\n"
+        if defined($lock) && $LOCKS{$vmid} ne $lock;
     delete $LOCKS{$vmid};
 
     return;
@@ -98,13 +102,34 @@ sub snapshot_create {
     return;
 }
 
+# Which snapshots the storage refuses to remove the volume of, keyed by name.
+# The real failure this models is an lvremove or zfs destroy that fails while
+# the container's config has already been marked - see the comment below.
+our %DELETE_DIE;
+
+# And whether even a forced removal fails, which is the case where the config
+# cannot be cleaned up at all and only the lock can be given back.
+our $DELETE_DIE_FORCE;
+
 sub snapshot_delete {
     my ($class, $vmid, $snapname, $force) = @_;
 
     die "snapshot '$snapname' does not exist\n"
         if !$CONFIGS{$vmid}->{snapshots}->{$snapname};
 
+    # Faithful to the order the real one works in, because that order is the
+    # whole bug: the lock and `snapstate: delete` are written BEFORE the volume
+    # is touched, so a storage failure leaves both behind and the container
+    # locked. set_lock refuses while any lock is set, force or not.
+    $class->set_lock($vmid, 'snapshot-delete');
+    $CONFIGS{$vmid}->{snapshots}->{$snapname}->{snapstate} = 'delete';
+
+    if (defined($DELETE_DIE{$snapname}) && (!$force || $DELETE_DIE_FORCE)) {
+        die "$DELETE_DIE{$snapname}\n";
+    }
+
     delete $CONFIGS{$vmid}->{snapshots}->{$snapname};
+    delete $LOCKS{$vmid};
 
     return;
 }

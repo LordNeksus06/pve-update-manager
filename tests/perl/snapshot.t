@@ -10,7 +10,7 @@ use strict;
 use warnings;
 
 use File::Temp qw(tempdir);
-use Test::More tests => 57;
+use Test::More tests => 68;
 
 use PVE::LXC;
 use PVE::LXC::Config;
@@ -387,10 +387,14 @@ my $ON = { snapshot_before => 1, snapshot_keep => 3 };
 
     ok(!defined($err), 'the run is still a skip');
     is(scalar(@PVE::Tools::RUN_CALLS), 0, 'and nothing ran');
+    # Pruning is attempted on this way out too - but removing a snapshot takes a
+    # lock of its own, so while somebody else holds the container nothing can be
+    # removed. Leaving all three is the right outcome: the alternative is taking
+    # a backup's lock off behind its back.
     is(
         scalar(@{ snapshots_of(101) }),
-        2,
-        'but the snapshot it had already taken was pruned back to the limit on the way out',
+        3,
+        'the snapshot it had already taken stays while somebody else holds the container',
     );
 }
 
@@ -421,4 +425,85 @@ my $ON = { snapshot_before => 1, snapshot_keep => 3 };
         2,
         'and that way out prunes too',
     );
+}
+
+# ── a removal that fails must not leave the container locked ────────────────
+#
+# Issue #14. PVE's snapshot_delete locks the container and writes
+# `snapstate: delete` into the snapshot BEFORE it asks the storage to remove the
+# volume. When that removal fails it dies with both still in place and nothing
+# ever clears them: the container is locked from then on, so its next update,
+# its next backup and its next start all refuse, and the web interface shows the
+# snapshot stuck in state "delete".
+{
+    local @PVE::Tools::RUN_CALLS = ();
+    local $PVE::Tools::RUN_RC = 0;
+    local %PVE::LXC::Config::LOCKS = ();
+
+    $PVE::LXC::Config::CONFIGS{101}->{snapshots} = {
+        'updmgr-20260101-000000' => { snaptime => 100 },
+        'updmgr-20260102-000000' => { snaptime => 200 },
+    };
+    local %PVE::LXC::Config::DELETE_DIE = (
+        'updmgr-20260101-000000' => 'lvremove failed: Logical volume in use',
+    );
+
+    my ($out) = run({ type => 'lxc', id => 101 }, { snapshot_before => 1, snapshot_keep => 2 });
+
+    is($PVE::LXC::Config::LOCKS{101}, undef, 'the container is not left locked by a failed removal');
+    my $left = snapshots_of(101);
+    is(scalar(@$left), 2, 'two snapshots are left, which is the retention count');
+    ok(
+        !grep({ $_ eq 'updmgr-20260101-000000' } @$left),
+        'and the half-deleted one is forced out of the config rather than left in it',
+    );
+    like($out, qr/could not remove the old snapshot updmgr-20260101-000000/, 'the reason is logged');
+    like($out, qr/forcing it out of the config/, 'and so is the repair');
+    like($out, qr/volume may still be on the storage/, 'including that the volume may survive it');
+}
+
+# The same failure where even the forced removal will not go through. The
+# snapshot stays, but the container must still come out usable, and the row has
+# to say so - a run that reports success while the guest is locked is the worst
+# of the outcomes.
+{
+    local @PVE::Tools::RUN_CALLS = ();
+    local $PVE::Tools::RUN_RC = 0;
+    local %PVE::LXC::Config::LOCKS = ();
+
+    $PVE::LXC::Config::CONFIGS{101}->{snapshots} = {
+        'updmgr-20260101-000000' => { snaptime => 100 },
+        'updmgr-20260102-000000' => { snaptime => 200 },
+    };
+    local %PVE::LXC::Config::DELETE_DIE = (
+        'updmgr-20260101-000000' => 'lvremove failed: Logical volume in use',
+    );
+    local $PVE::LXC::Config::DELETE_DIE_FORCE = 1;
+
+    run({ type => 'lxc', id => 101 }, { snapshot_before => 1, snapshot_keep => 2 });
+
+    is($PVE::LXC::Config::LOCKS{101}, undef, 'the container is unlocked even when the force fails');
+    like(
+        PVE::UpdateManager::Config::load_state('lxc', 101)->{note} // '',
+        qr/1 snapshot could NOT be removed/,
+        'and the row says a snapshot is stuck instead of reporting a clean run',
+    );
+}
+
+# A lock that is not ours is not ours to remove. A container being backed up
+# while its snapshot cannot be deleted must come out of this still locked by the
+# backup.
+{
+    local %PVE::LXC::Config::LOCKS = (101 => 'backup');
+    $PVE::LXC::Config::CONFIGS{101}->{snapshots} = {
+        'updmgr-20260101-000000' => { snaptime => 100, snapstate => 'delete' },
+    };
+    my @log;
+
+    my $repaired = PVE::UpdateManager::Runner::_repair_stuck_delete(
+        101, 'updmgr-20260101-000000', sub { push @log, $_[0] });
+
+    is($PVE::LXC::Config::LOCKS{101}, 'backup', "somebody else's lock is left alone");
+    ok(!$repaired, 'so the half-deleted snapshot is reported as stuck instead of forced');
+    like(join("\n", @log), qr/not ours to remove/, 'and the log says why nothing was done');
 }

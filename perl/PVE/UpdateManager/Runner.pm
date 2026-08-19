@@ -314,11 +314,105 @@ sub snapshot_lxc {
 # Never dies. Pruning is housekeeping that runs after the update; a snapshot
 # that cannot be removed is a warning in the log and a disk that fills up
 # slower than it would have, not a failed update.
+# The lock PVE sets on a container while it removes one of its snapshots. It is
+# set BEFORE the volume is touched and removed again at the very end, so a
+# failure in between leaves it behind - see _repair_stuck_delete.
+our $SNAPSHOT_DELETE_LOCK = 'snapshot-delete';
+
+# Take back a 'snapshot-delete' lock a failed removal left on the container.
+#
+# Deliberately narrow: only that exact value is removed. A 'backup', 'mounted'
+# or 'migrate' lock means somebody else is holding the container and clearing it
+# would be the addon breaking the very rule it obeys everywhere else.
+sub _clear_delete_lock {
+    my ($vmid, $logfunc) = @_;
+
+    my $conf = eval { PVE::LXC::Config->load_config($vmid) } // {};
+    my $lock = $conf->{lock};
+    return 1 if !defined($lock) || !length($lock);
+
+    if ($lock ne $SNAPSHOT_DELETE_LOCK) {
+        $logfunc->("CT $vmid carries a '$lock' lock, which is not ours to remove")
+            if $logfunc;
+        return 0;
+    }
+
+    if (!eval { PVE::LXC::Config->remove_lock($vmid, $SNAPSHOT_DELETE_LOCK); 1 }) {
+        my $err = $@ // '';
+        chomp($err);
+        $logfunc->("WARNING: CT $vmid stays locked ($SNAPSHOT_DELETE_LOCK) - $err")
+            if $logfunc;
+        return 0;
+    }
+
+    $logfunc->("removed the '$SNAPSHOT_DELETE_LOCK' lock the failed removal left on CT $vmid")
+        if $logfunc;
+
+    return 1;
+}
+
+# Undo what a failed snapshot removal leaves behind.
+#
+# PVE's snapshot_delete locks the container with 'snapshot-delete' and writes
+# `snapstate: delete` into the snapshot BEFORE it asks the storage to remove the
+# volume. If that removal fails it dies with both still in the config, and
+# nothing ever clears them: every later operation on the container - the next
+# update, a backup, a start - then refuses because the guest is locked, and the
+# web interface shows the snapshot with the status "delete" forever. The
+# documented repair is `pct unlock` followed by `pct delsnapshot --force`, and
+# that is exactly what happens here.
+#
+# The force pass can leave the volume itself on the storage - that is what force
+# means - so it says so with the name to look for rather than reporting a clean
+# removal.
+sub _repair_stuck_delete {
+    my ($vmid, $name, $logfunc) = @_;
+
+    return 0 if !is_our_snapshot($name);
+
+    my $conf = eval { PVE::LXC::Config->load_config($vmid) } // {};
+    my $snap = $conf->{snapshots}->{$name};
+    my $pending = $snap && ($snap->{snapstate} // '') eq 'delete';
+    my $locked = defined($conf->{lock}) && $conf->{lock} eq $SNAPSHOT_DELETE_LOCK;
+
+    # The removal failed before it changed anything - the container is usable
+    # and there is nothing half-done to clean up.
+    return 1 if !$pending && !$locked;
+
+    # The lock has to go first: snapshot_delete takes it again itself, and
+    # set_lock refuses outright while any lock is set, force or not.
+    return 0 if !_clear_delete_lock($vmid, $logfunc);
+
+    return 1 if !$pending;
+
+    $logfunc->("snapshot $name is half removed - forcing it out of the config")
+        if $logfunc;
+
+    if (!eval { PVE::LXC::Config->snapshot_delete($vmid, $name, 1); 1 }) {
+        my $err = $@ // '';
+        chomp($err);
+        $logfunc->("WARNING: forcing the removal of $name failed too - $err") if $logfunc;
+        # The forced attempt will have taken the lock again on its way in.
+        _clear_delete_lock($vmid, $logfunc);
+        return 0;
+    }
+
+    $logfunc->(
+        "snapshot $name is out of the config, but its volume may still be on the"
+        . " storage - look for a volume named after the snapshot")
+        if $logfunc;
+
+    return 1;
+}
+
+# Returns how many snapshots were removed. In list context also an arrayref of
+# the ones that are still half-deleted, so the caller can say so in the row
+# rather than only in the log.
 sub prune_snapshots {
     my ($vmid, $keep, $logfunc) = @_;
 
     my $safe = eval { _safe_vmid($vmid) };
-    return 0 if !defined($safe);
+    return wantarray ? (0, []) : 0 if !defined($safe);
 
     # The floor is one, not zero: keeping none would delete the snapshot the run
     # has just taken. The pattern is checked before the comparison because this
@@ -335,23 +429,28 @@ sub prune_snapshots {
         keys %$snapshots;
 
     my $excess = scalar(@ours) - $keep;
-    return 0 if $excess <= 0;
+    return wantarray ? (0, []) : 0 if $excess <= 0;
 
     my $removed = 0;
+    my $stuck = [];
     for my $name (@ours[0 .. $excess - 1]) {
         $logfunc->("removing old update snapshot $name") if $logfunc;
 
-        eval { PVE::LXC::Config->snapshot_delete($safe, $name, 0); 1 } or do {
-            my $err = $@ // '';
-            chomp($err);
-            $logfunc->("WARNING: could not remove the old snapshot $name - $err") if $logfunc;
+        if (eval { PVE::LXC::Config->snapshot_delete($safe, $name, 0); 1 }) {
+            $removed++;
             next;
-        };
+        }
 
-        $removed++;
+        my $err = $@ // '';
+        chomp($err);
+        $logfunc->("WARNING: could not remove the old snapshot $name - $err") if $logfunc;
+
+        # Whatever the storage's reason was, the container must not be left
+        # locked over it.
+        push @$stuck, $name if !_repair_stuck_delete($safe, $name, $logfunc);
     }
 
-    return $removed;
+    return wantarray ? ($removed, $stuck) : $removed;
 }
 
 # ── Keeping things from being switched off mid-update ────────────────────────

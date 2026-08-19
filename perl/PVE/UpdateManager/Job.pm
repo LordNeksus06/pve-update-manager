@@ -284,13 +284,18 @@ sub run_one {
     # that snapshots and then returns early - the lock taken in the gap above,
     # a container that will not start - would otherwise add one snapshot per
     # attempt and never drop any, and snapshot_keep would quietly mean nothing.
+    # What a failed removal left behind that could not be repaired. It belongs
+    # in the row and not only in the log: a container that is still locked will
+    # refuse its next update, its next backup and its next start, and nobody
+    # reads the log of a run that reported success.
+    my $stuck = [];
     my $prune = sub {
         return if !defined($snapshot);
 
         # The count is spelled out rather than left to prune_snapshots' own
         # floor of one: a caller that asked for a snapshot and forgot to say how
         # many to keep would otherwise lose every earlier one on the first run.
-        PVE::UpdateManager::Runner::prune_snapshots(
+        (undef, $stuck) = PVE::UpdateManager::Runner::prune_snapshots(
             $target->{id},
             $opts->{snapshot_keep} // $PVE::UpdateManager::Config::DEFAULT_SNAPSHOT_KEEP,
             $logfunc,
@@ -427,9 +432,17 @@ sub run_one {
     # the moment the task log is least likely to still be the thing being read.
     $note .= ", snapshot $snapshot" if defined($snapshot) && $rc != 0;
 
+    # A snapshot PVE could neither remove nor be talked out of holding. The
+    # container may still be locked, which stops its next update as well, so it
+    # is said on the row and not left to the log.
+    my $wedged = scalar(@{ $stuck // [] });
+    $note .= ", $wedged snapshot" . ($wedged == 1 ? '' : 's') . " could NOT be removed"
+        if $wedged;
+
     $state->{note} = $note
         if $dropped
         || $shutdown_failed
+        || $wedged
         || (defined($snapshot) && $rc != 0)
         || $rc == $PVE::UpdateManager::Runner::TIMEOUT_RC;
 

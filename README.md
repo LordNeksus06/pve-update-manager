@@ -84,10 +84,18 @@ is written.
 | storage cannot | updated anyway, the log says so |
 | snapshot fails | the target fails before the update starts |
 
-Good to know: capability is asked per container via Proxmox' own
-`has_feature('snapshot')` — ZFS, LVM-thin, RBD and btrfs qualify, a directory
-storage does not. Only names matching `updmgr-<8 digits>-<6 digits>` are ever
-removed, and age comes from Proxmox' `snaptime`, not from the name.
+Good to know:
+
+- Capability is asked per container via Proxmox' own `has_feature('snapshot')`
+  — ZFS, LVM-thin, RBD and btrfs qualify, a directory storage does not.
+- Only names matching `updmgr-<8 digits>-<6 digits>` are ever removed, and age
+  comes from Proxmox' `snaptime`, not from the name.
+- A removal that fails leaves PVE's `snapshot-delete` lock and a snapshot in
+  state `delete` behind, which blocks the container's next update, backup and
+  start. That is detected and undone: the lock is taken back and the snapshot is
+  forced out of the config, with a warning that its volume may still be on the
+  storage. Only a lock whose value is exactly `snapshot-delete` is ever removed,
+  and the row says how many snapshots are still stuck.
 
 ## Scheduled runs
 
