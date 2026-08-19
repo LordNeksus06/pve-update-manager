@@ -46,15 +46,33 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    # Install only what the image is actually missing, and never wait for a
+    # lock forever. The runner's own apt-daily jobs hold /var/lib/dpkg/lock at
+    # boot, and apt's default is to wait for it without a limit - which is how
+    # this step sat at "Install deps" for 1h35m without producing a line.
+    # nodejs is here for `node --check` on the UI file and for the interface
+    # tests, which load it into a V8 context; there is no build step for the
+    # JavaScript, it ships as written.
     - name: Install deps
+      timeout-minutes: 10
+      env:
+        DEBIAN_FRONTEND: noninteractive
       run: |
         set -euo pipefail
-        sudo apt-get update -qq
-        # nodejs for `node --check` on the UI file and for the interface tests,
-        # which load it into a V8 context - there is no build step for the
-        # JavaScript, it ships as written.
+        declare -A pkg=( [make]=make [shellcheck]=shellcheck [perl]=perl \
+                         [node]=nodejs [dpkg-deb]=dpkg )
+        missing=()
+        for tool in "${!pkg[@]}"; do
+          command -v "$tool" >/dev/null 2>&1 || missing+=("${pkg[$tool]}")
+        done
+        if [ ${#missing[@]} -eq 0 ]; then
+          echo ":: the image already has everything"
+          exit 0
+        fi
+        echo ":: installing ${missing[*]}"
+        sudo apt-get update -qq -o DPkg::Lock::Timeout=120
         sudo apt-get install -y --no-install-recommends \
-          make shellcheck perl nodejs dpkg-dev
+          -o DPkg::Lock::Timeout=120 "${missing[@]}"
 
     - name: make check (shellcheck, perl -c, node --check)
       run: make check
@@ -126,10 +144,22 @@ jobs:
         fetch-depth: 0
 
     - name: Install deps
+      timeout-minutes: 10
+      env:
+        DEBIAN_FRONTEND: noninteractive
       run: |
         set -euo pipefail
-        sudo apt-get update -qq
-        sudo apt-get install -y --no-install-recommends make dpkg-dev
+        missing=()
+        command -v make >/dev/null 2>&1 || missing+=(make)
+        command -v dpkg-deb >/dev/null 2>&1 || missing+=(dpkg)
+        if [ ${#missing[@]} -eq 0 ]; then
+          echo ":: the image already has everything"
+          exit 0
+        fi
+        echo ":: installing ${missing[*]}"
+        sudo apt-get update -qq -o DPkg::Lock::Timeout=120
+        sudo apt-get install -y --no-install-recommends \
+          -o DPkg::Lock::Timeout=120 "${missing[@]}"
 
     - name: Build the release artifacts
       id: build
