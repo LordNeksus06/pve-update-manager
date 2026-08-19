@@ -8,6 +8,7 @@ use strict;
 use warnings;
 
 use PVE::LXC::Config;
+use PVE::Storage;
 use PVE::Tools;
 
 our $PCT = '/usr/sbin/pct';
@@ -209,6 +210,148 @@ sub shutdown_lxc {
     $logfunc->('graceful shutdown did not finish, stopping the container');
 
     return _run([$PCT, 'stop', $safe], 60, $logfunc);
+}
+
+# ── A rollback point before the update ──────────────────────────────────────
+#
+# A dist-upgrade is the operation people most want to be able to undo, and on a
+# storage that can snapshot, undoing it costs a second. So this is on by
+# default - but only where the storage really can, which is not a question about
+# ZFS: LVM-thin, RBD and btrfs snapshot too, and a container on a directory
+# storage cannot however the node is set up. PVE already knows the answer per
+# container, and asking it is better than keeping our own list of storage types
+# that would be wrong the first time a plugin gains the feature.
+
+our $SNAPSHOT_PREFIX = 'updmgr';
+
+# The name has to satisfy PVE's pve-configid format - a letter first, then
+# letters, digits, underscores and dashes, at most 40 characters - which
+# `updmgr-20260819-031500` does at 22.
+#
+# Local time, because this name is what an operator reads in the snapshot list
+# and a UTC timestamp there is a puzzle. It is deliberately NOT what the pruning
+# below sorts on: an hour repeats itself once a year and a name that sorts
+# wrongly would delete the wrong snapshot.
+sub snapshot_name {
+    my ($when) = @_;
+
+    my @t = localtime($when // time());
+
+    return sprintf(
+        '%s-%04d%02d%02d-%02d%02d%02d',
+        $SNAPSHOT_PREFIX, $t[5] + 1900, $t[4] + 1, $t[3], $t[2], $t[1], $t[0],
+    );
+}
+
+# Ours and nobody else's. Whatever is pruned has to be something this addon made:
+# deleting a snapshot somebody took by hand before a migration would be a data
+# loss with our name on it.
+sub is_our_snapshot {
+    my ($name) = @_;
+
+    return defined($name) && $name =~ m/\A\Q$SNAPSHOT_PREFIX\E-\d{8}-\d{6}\z/ ? 1 : 0;
+}
+
+# Can this container be snapshotted at all? PVE's own answer, per container -
+# every one of its volumes has to support it, which is why a container with one
+# mountpoint on a directory storage says no even on a node full of ZFS.
+#
+# Never dies: this is asked while building a settings dialog and while deciding
+# whether to snapshot, and neither is a place to fail over a storage.cfg that
+# cannot be read. Unknown means "no", which costs a snapshot and never a run.
+# $storecfg is optional and only an optimisation: the settings endpoint asks
+# this for every container on the node in turn, and reading storage.cfg once for
+# all of them also means one warning in the syslog rather than one per container
+# when it is the storage config that is broken.
+sub can_snapshot {
+    my ($vmid, $storecfg) = @_;
+
+    my $safe = eval { _safe_vmid($vmid) };
+    return 0 if !defined($safe);
+
+    my $res = eval {
+        my $conf = PVE::LXC::Config->load_config($safe);
+        $storecfg //= PVE::Storage::config();
+
+        # $snapname and $running are both undef: the question is whether a
+        # snapshot can be taken of the container as it is now, and for a
+        # container the storage plugins do not consult the running state at all -
+        # that argument exists for a VM's saved memory, which an LXC snapshot
+        # never has.
+        PVE::LXC::Config->has_feature('snapshot', $conf, $storecfg, undef, undef);
+    };
+    if (my $err = $@) {
+        chomp($err);
+        warn "pve-update-manager: cannot tell whether CT $safe can be snapshotted: $err\n";
+        return 0;
+    }
+
+    return $res ? 1 : 0;
+}
+
+# Returns the name of the snapshot it made, or dies. Dying is the point: the
+# caller asked for a rollback point on a storage that says it can provide one,
+# and a run that quietly went ahead without it would have removed the safety net
+# in exactly the situation - a full thin pool - where it is needed most.
+sub snapshot_lxc {
+    my ($vmid, $logfunc, $when) = @_;
+
+    my $safe = _safe_vmid($vmid);
+    my $name = snapshot_name($when);
+
+    $logfunc->("taking snapshot $name before the update") if $logfunc;
+
+    PVE::LXC::Config->snapshot_create($safe, $name, 0, 'pve-update-manager: before the update');
+
+    return $name;
+}
+
+# Keeps the newest $keep of OUR snapshots and removes the rest.
+#
+# Ordered by the snaptime PVE records in the config rather than by the name: the
+# names carry local time, and one hour a year is lived through twice.
+#
+# Never dies. Pruning is housekeeping that runs after the update; a snapshot
+# that cannot be removed is a warning in the log and a disk that fills up
+# slower than it would have, not a failed update.
+sub prune_snapshots {
+    my ($vmid, $keep, $logfunc) = @_;
+
+    my $safe = eval { _safe_vmid($vmid) };
+    return 0 if !defined($safe);
+
+    # The floor is one, not zero: keeping none would delete the snapshot the run
+    # has just taken. The pattern is checked before the comparison because this
+    # is callable with whatever a settings file happened to contain, and `<` on
+    # a non-number is a warning in the task log rather than an answer.
+    $keep = 1 if !defined($keep) || "$keep" !~ m/\A\d+\z/ || $keep < 1;
+
+    my $snapshots = eval { PVE::LXC::Config->load_config($safe)->{snapshots} } || {};
+
+    my @ours =
+        sort { ($snapshots->{$a}->{snaptime} // 0) <=> ($snapshots->{$b}->{snaptime} // 0)
+                or $a cmp $b }
+        grep { is_our_snapshot($_) }
+        keys %$snapshots;
+
+    my $excess = scalar(@ours) - $keep;
+    return 0 if $excess <= 0;
+
+    my $removed = 0;
+    for my $name (@ours[0 .. $excess - 1]) {
+        $logfunc->("removing old update snapshot $name") if $logfunc;
+
+        eval { PVE::LXC::Config->snapshot_delete($safe, $name, 0); 1 } or do {
+            my $err = $@ // '';
+            chomp($err);
+            $logfunc->("WARNING: could not remove the old snapshot $name - $err") if $logfunc;
+            next;
+        };
+
+        $removed++;
+    }
+
+    return $removed;
 }
 
 # ── Keeping things from being switched off mid-update ────────────────────────

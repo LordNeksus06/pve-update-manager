@@ -133,7 +133,8 @@ __PACKAGE__->register_method({
     method => 'DELETE',
     protected => 1,
     proxyto => 'node',
-    description => "Delete the stored update script of a container.",
+    description => "Delete the stored update script of a container. With 'purge' the"
+        . " recorded last run goes too, which is what the destroy dialog asks for.",
     permissions => {
         check => ['perm', '/vms/{vmid}', ['VM.Config.Options']],
     },
@@ -142,13 +143,27 @@ __PACKAGE__->register_method({
         properties => {
             node => get_standard_option('pve-node'),
             vmid => get_standard_option('pve-vmid'),
+            purge => {
+                type => 'boolean',
+                optional => 1,
+                default => 0,
+                description => "Also delete the recorded last run. Off by default, because"
+                    . " removing a target's commands is not the same as forgetting when it"
+                    . " was last updated - the two columns say different things and both"
+                    . " stay true after a delete. The destroy dialog sets it: keeping a"
+                    . " record for a container that no longer exists would hand it to"
+                    . " whatever is created with that vmid next.",
+            },
         },
     },
     returns => { type => 'null' },
     code => sub {
         my ($param) = @_;
 
-        PVE::UpdateManager::Config::delete_script('lxc', $param->{vmid});
+        my $vmid = $param->{vmid};
+
+        PVE::UpdateManager::Config::delete_script('lxc', $vmid);
+        PVE::UpdateManager::Config::delete_state('lxc', $vmid) if $param->{purge};
 
         return undef;
     },
@@ -202,7 +217,7 @@ __PACKAGE__->register_method({
         # it runs on, which is where the Settings dialog lives.
         my $settings = PVE::UpdateManager::Config::load_settings($param->{node});
         my $timeout = $param->{timeout} // $settings->{timeout};
-        my $opts = { start_stopped => $settings->{start_stopped} };
+        my $opts = PVE::UpdateManager::Config::run_opts($settings);
 
         if (defined(my $script = $param->{script})) {
             raise_param_exc({ script => "must not be empty" }) if $script !~ m/\S/;

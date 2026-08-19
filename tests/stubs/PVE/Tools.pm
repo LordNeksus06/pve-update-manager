@@ -27,6 +27,13 @@ sub file_get_contents {
     my $data = <$fh>;
     close($fh);
 
+    # An EMPTY file reads back as the empty string, not as undef. A slurp of
+    # nothing returns undef in Perl, and the real file_get_contents does not -
+    # it builds its answer with sysread and hands back ''. A stub that returned
+    # undef here would make every "the file exists but is empty" path in the
+    # callers untestable, because they all check defined() first.
+    $data //= '';
+
     # The real one dies here rather than truncating, and a stub that quietly
     # returned the whole file would make the tests for oversized scripts prove
     # nothing. Same message, so the tests read like the production failure.

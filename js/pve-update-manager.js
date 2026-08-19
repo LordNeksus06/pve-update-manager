@@ -45,34 +45,121 @@ if (typeof Proxmox !== 'undefined' && Proxmox.Utils && Proxmox.Utils.override_ta
     });
 }
 
-// Starting points offered by the Templates menu. They are suggestions pasted
-// into the text box, never something that runs on its own.
-PVE.updmgr.TEMPLATES = [
-    {
-        name: 'Debian / Ubuntu (apt)',
-        script:
-            '#!/bin/bash\n' +
-            'set -e\n' +
-            'export DEBIAN_FRONTEND=noninteractive\n' +
-            '\n' +
-            'apt-get update\n' +
-            'apt-get -y -o Dpkg::Options::=--force-confold dist-upgrade\n' +
-            'apt-get -y --purge autoremove\n' +
-            'apt-get clean\n',
-    },
-    {
-        name: 'Alpine (apk)',
-        script: '#!/bin/sh\n' + 'set -e\n' + '\n' + 'apk update\n' + 'apk upgrade\n',
-    },
-    {
-        name: 'Arch (pacman)',
-        script: '#!/bin/bash\n' + 'set -e\n' + '\n' + 'pacman -Syu --noconfirm\n',
-    },
-    {
-        name: 'Fedora / RHEL (dnf)',
-        script: '#!/bin/bash\n' + 'set -e\n' + '\n' + 'dnf -y upgrade --refresh\n',
-    },
-];
+// ── The Templates menu ──────────────────────────────────────────────────────
+//
+// Starting points pasted into the text box, never something that runs on its
+// own. The list itself comes from /cluster/updatemgr/templates: it is editable
+// and stored in /etc/pve, so there is exactly one menu for the whole cluster
+// and the shipped defaults live in the Perl that has to answer with them. A
+// second copy of those scripts here is how the two would drift apart.
+
+// Filled on the first menu open and reused afterwards - a menu that fetched its
+// own contents on every click would be a request per click for a list that
+// changes about once a year. `undefined` means "not fetched yet"; the manager
+// window clears it after every write.
+PVE.updmgr.templateCache = undefined;
+
+PVE.updmgr.loadTemplates = function (callback, force) {
+    if (PVE.updmgr.templateCache && !force) {
+        callback(PVE.updmgr.templateCache);
+        return;
+    }
+
+    Proxmox.Utils.API2Request({
+        url: '/cluster/updatemgr/templates',
+        method: 'GET',
+        failure: function (response) {
+            // Deliberately not a dialog. This is a convenience menu; an old
+            // server or a cluster subtree that failed to register may cost the
+            // suggestions, and the text box still works without them.
+            console.error(
+                'pve-update-manager: could not load the templates',
+                response.htmlStatus,
+            );
+            callback({ custom: false, templates: [] });
+        },
+        success: function (response) {
+            PVE.updmgr.templateCache = response.result.data;
+            callback(PVE.updmgr.templateCache);
+        },
+    });
+};
+
+// Editing the list is a datacenter-wide change - one menu, every node - so it
+// takes the privilege datacenter options take, and not the one that edits a
+// single container's commands.
+PVE.updmgr.canManageTemplates = function () {
+    let caps = Ext.state.Manager.get('GuiCap') || {};
+    return !!(caps.dc || {})['Sys.Modify'];
+};
+
+// The items of a Templates menu, given what the server answered. Split out from
+// the button below because this is the part with decisions in it: what an empty
+// list looks like, and whether the Manage entry is there at all.
+PVE.updmgr.templateMenuItems = function (data, apply, onManage) {
+    let items = (data.templates || []).map(function (tpl) {
+        return {
+            text: tpl.name,
+            handler: function () {
+                apply(tpl.script);
+            },
+        };
+    });
+
+    // A menu that opens empty reads as broken. Say which of the two it is.
+    if (!items.length) {
+        items.push({
+            text: data.custom
+                ? gettext('No templates - all of them were removed')
+                : gettext('No templates'),
+            disabled: true,
+        });
+    }
+
+    if (onManage) {
+        items.push('-', {
+            text: gettext('Manage Templates'),
+            iconCls: 'fa fa-cog',
+            handler: onManage,
+        });
+    }
+
+    return items;
+};
+
+PVE.updmgr.templateMenuButton = function (apply) {
+    return {
+        text: gettext('Templates'),
+        iconCls: 'fa fa-file-text-o',
+        menu: {
+            // Rebuilt on every open rather than once at construction: an edit
+            // made in the manager window has to show up in the menu of an
+            // editor that was already on screen when it was made.
+            items: [{ text: gettext('Loading...'), disabled: true }],
+            listeners: {
+                beforeshow: function (menu) {
+                    PVE.updmgr.loadTemplates(function (data) {
+                        if (menu.destroyed) {
+                            return;
+                        }
+                        menu.removeAll();
+                        menu.add(
+                            PVE.updmgr.templateMenuItems(
+                                data,
+                                apply,
+                                PVE.updmgr.canManageTemplates()
+                                    ? function () {
+                                          Ext.create('PVE.updmgr.TemplateWindow').show();
+                                      }
+                                    : undefined,
+                            ),
+                        );
+                    });
+                },
+            },
+        },
+    };
+};
 
 // ── Shared helpers ──────────────────────────────────────────────────────────
 
@@ -574,20 +661,11 @@ Ext.define('PVE.updmgr.ScriptPanel', {
         }
 
         if (me.canEdit) {
-            tbar.push({
-                text: gettext('Templates'),
-                iconCls: 'fa fa-file-text-o',
-                menu: {
-                    items: PVE.updmgr.TEMPLATES.map(function (tpl) {
-                        return {
-                            text: tpl.name,
-                            handler: function () {
-                                me.editor.setValue(tpl.script);
-                            },
-                        };
-                    }),
-                },
-            });
+            tbar.push(
+                PVE.updmgr.templateMenuButton(function (script) {
+                    me.editor.setValue(script);
+                }),
+            );
         }
 
         tbar.push('->', me.statusText, me.logButton);
@@ -939,20 +1017,9 @@ Ext.define('PVE.updmgr.MultiScriptWindow', {
             items: [me.editor],
             tbar: [
                 me.saveButton,
-                {
-                    text: gettext('Templates'),
-                    iconCls: 'fa fa-file-text-o',
-                    menu: {
-                        items: PVE.updmgr.TEMPLATES.map(function (tpl) {
-                            return {
-                                text: tpl.name,
-                                handler: function () {
-                                    me.editor.setValue(tpl.script);
-                                },
-                            };
-                        }),
-                    },
-                },
+                PVE.updmgr.templateMenuButton(function (script) {
+                    me.editor.setValue(script);
+                }),
             ],
             // The status line is NOT a tbtext in the toolbar above. A toolbar
             // lays its items out on one row and clips what does not fit, and
@@ -982,6 +1049,325 @@ Ext.define('PVE.updmgr.MultiScriptWindow', {
         me.callParent();
 
         me.load();
+    },
+});
+
+// ── Managing the Templates menu ─────────────────────────────────────────────
+//
+// One list for the whole cluster, stored in /etc/pve. Until something is
+// changed here the menu is the built-in set that ships with the package; the
+// first change writes the whole set out, so from then on a shipped default no
+// longer moves under a user who edited a different entry. Reset throws the
+// stored list away and follows the shipped defaults again.
+Ext.define('PVE.updmgr.TemplateEditWindow', {
+    extend: 'Ext.window.Window',
+
+    width: 760,
+    height: 560,
+    layout: 'fit',
+    modal: true,
+    resizable: true,
+
+    // set by the caller: the entry being changed, or undefined when adding
+    template: undefined,
+
+    submit: function () {
+        let me = this;
+
+        let name = me.down('#name').getValue();
+        let script = me.editor.getValue();
+
+        if (!name || !name.match(/\S/)) {
+            Ext.Msg.alert(gettext('Error'), gettext('A template needs a name.'));
+            return;
+        }
+        if (!script || !script.match(/\S/)) {
+            Ext.Msg.alert(gettext('Error'), gettext('A template needs commands.'));
+            return;
+        }
+
+        let params = { name: name, script: script };
+        // Only on a real rename: sending oldname === name would make the server
+        // look for an entry that may not exist yet, turning an add into an
+        // error.
+        if (me.template && me.template.name !== name) {
+            params.oldname = me.template.name;
+        }
+
+        Proxmox.Utils.API2Request({
+            url: '/cluster/updatemgr/templates',
+            method: 'PUT',
+            params: params,
+            waitMsgTarget: me,
+            failure: function (response) {
+                Ext.Msg.alert(gettext('Error'), response.htmlStatus);
+            },
+            success: function () {
+                me.close();
+            },
+        });
+    },
+
+    initComponent: function () {
+        let me = this;
+
+        me.editor = Ext.create('Ext.form.field.TextArea', {
+            hideLabel: true,
+            spellcheck: false,
+            value: me.template ? me.template.script : '',
+            emptyText: gettext('The commands this entry pastes into the editor.'),
+            fieldStyle: {
+                'font-family': 'monospace',
+                'font-size': '12px',
+                'white-space': 'pre',
+                'overflow-wrap': 'normal',
+                'overflow-x': 'auto',
+            },
+        });
+
+        Ext.apply(me, {
+            title: me.template
+                ? Ext.String.format(gettext('Edit template: {0}'), me.template.name)
+                : gettext('New template'),
+            items: [me.editor],
+            dockedItems: [
+                {
+                    xtype: 'toolbar',
+                    dock: 'top',
+                    items: [
+                        {
+                            xtype: 'textfield',
+                            itemId: 'name',
+                            fieldLabel: gettext('Name'),
+                            labelWidth: 50,
+                            width: 500,
+                            allowBlank: false,
+                            value: me.template ? me.template.name : '',
+                        },
+                    ],
+                },
+            ],
+            buttons: [
+                {
+                    text: gettext('Cancel'),
+                    handler: function () {
+                        me.close();
+                    },
+                },
+                {
+                    text: gettext('OK'),
+                    iconCls: 'fa fa-floppy-o',
+                    handler: function () {
+                        me.submit();
+                    },
+                },
+            ],
+        });
+
+        me.callParent();
+    },
+});
+
+Ext.define('PVE.updmgr.TemplateWindow', {
+    extend: 'Ext.window.Window',
+
+    width: 700,
+    height: 480,
+    layout: 'fit',
+    modal: true,
+    resizable: true,
+
+    title: gettext('Update Manager templates'),
+
+    reload: function () {
+        let me = this;
+
+        // force: this window is the one place that just changed the list, so
+        // reading the cache back would show the state before its own write.
+        PVE.updmgr.loadTemplates(function (data) {
+            if (me.destroyed) {
+                return;
+            }
+            me.grid.getStore().loadData(data.templates || []);
+            me.down('#reset').setDisabled(!data.custom);
+            me.down('#stored').setHtml(
+                Ext.String.htmlEncode(
+                    data.custom
+                        ? gettext('This list is stored in /etc/pve and shared by every node.')
+                        : gettext(
+                              'These are the built-in templates. Changing one stores the whole list.',
+                          ),
+                ),
+            );
+        }, true);
+    },
+
+    // Every write goes through here so exactly one thing has to be remembered:
+    // the cached menu is stale the moment the server accepted a change.
+    //
+    // The URL is passed in whole, query string included, because a DELETE does
+    // not reliably carry `params` to this API - the toolkit's own
+    // ConfirmRemoveDialog builds its query string by hand for exactly that
+    // reason.
+    write: function (method, url, params) {
+        let me = this;
+
+        Proxmox.Utils.API2Request({
+            url: url,
+            method: method,
+            params: params,
+            waitMsgTarget: me,
+            failure: function (response) {
+                Ext.Msg.alert(gettext('Error'), response.htmlStatus);
+            },
+            success: function () {
+                PVE.updmgr.templateCache = undefined;
+                me.reload();
+            },
+        });
+    },
+
+    edit: function (rec) {
+        let me = this;
+
+        let win = Ext.create('PVE.updmgr.TemplateEditWindow', {
+            template: rec ? { name: rec.data.name, script: rec.data.script } : undefined,
+        });
+        win.on('destroy', function () {
+            PVE.updmgr.templateCache = undefined;
+            me.reload();
+        });
+        win.show();
+    },
+
+    initComponent: function () {
+        let me = this;
+
+        me.grid = Ext.create('Ext.grid.GridPanel', {
+            border: false,
+            store: Ext.create('Ext.data.Store', {
+                fields: ['name', 'script'],
+                data: [],
+            }),
+            columns: [
+                { header: gettext('Name'), dataIndex: 'name', width: 260 },
+                {
+                    header: gettext('Commands'),
+                    dataIndex: 'script',
+                    flex: 1,
+                    // The first line that is neither empty nor a comment: the
+                    // shebang and the header comment are the same in half the
+                    // entries, so showing those would make every row look alike.
+                    renderer: function (script) {
+                        let line = String(script || '')
+                            .split('\n')
+                            .find((l) => l.match(/\S/) && !l.match(/^\s*#/));
+                        return Ext.String.htmlEncode(line || '');
+                    },
+                },
+            ],
+            listeners: {
+                itemdblclick: function (view, rec) {
+                    me.edit(rec);
+                },
+            },
+        });
+
+        Ext.apply(me, {
+            items: [me.grid],
+            tbar: [
+                {
+                    text: gettext('Add'),
+                    iconCls: 'fa fa-plus',
+                    handler: function () {
+                        me.edit(undefined);
+                    },
+                },
+                {
+                    text: gettext('Edit'),
+                    iconCls: 'fa fa-pencil',
+                    handler: function () {
+                        let rec = me.grid.getSelection()[0];
+                        if (rec) {
+                            me.edit(rec);
+                        }
+                    },
+                },
+                {
+                    text: gettext('Remove'),
+                    iconCls: 'fa fa-trash-o',
+                    handler: function () {
+                        let rec = me.grid.getSelection()[0];
+                        if (!rec) {
+                            return;
+                        }
+                        Ext.Msg.confirm(
+                            gettext('Confirm'),
+                            Ext.String.format(
+                                gettext('Remove the template "{0}" from the menu?'),
+                                rec.data.name,
+                            ),
+                            function (btn) {
+                                if (btn === 'yes') {
+                                    me.write(
+                                        'DELETE',
+                                        '/cluster/updatemgr/templates?name='
+                                            + encodeURIComponent(rec.data.name),
+                                    );
+                                }
+                            },
+                        );
+                    },
+                },
+                '-',
+                {
+                    text: gettext('Reset to Defaults'),
+                    itemId: 'reset',
+                    iconCls: 'fa fa-undo',
+                    disabled: true,
+                    handler: function () {
+                        Ext.Msg.confirm(
+                            gettext('Confirm'),
+                            gettext(
+                                'Throw the stored template list away and go back to the'
+                                    + ' built-in templates? Every entry added or edited here'
+                                    + ' is lost.',
+                            ),
+                            function (btn) {
+                                if (btn === 'yes') {
+                                    // Its own path, not a DELETE with the name
+                                    // left off: a parameter that goes missing
+                                    // must not turn a removal into a reset.
+                                    me.write('POST', '/cluster/updatemgr/templates/reset');
+                                }
+                            },
+                        );
+                    },
+                },
+            ],
+            dockedItems: [
+                {
+                    xtype: 'component',
+                    itemId: 'stored',
+                    dock: 'bottom',
+                    padding: '6 10',
+                    style: { 'white-space': 'normal' },
+                    html: '',
+                },
+            ],
+            buttons: [
+                {
+                    text: gettext('Close'),
+                    handler: function () {
+                        me.close();
+                    },
+                },
+            ],
+        });
+
+        me.callParent();
+
+        me.reload();
     },
 });
 
@@ -1590,7 +1976,8 @@ Ext.define('PVE.updmgr.TargetGrid', {
                         me.editSelected();
                     },
                 },
-                // Node tab only - see PVE.updmgr.NodePanel.
+                // Node and datacenter tabs, not the container tab - see
+                // PVE.updmgr.NodePanel and PVE.updmgr.DcPanel.
                 {
                     text: gettext('Settings'),
                     iconCls: 'fa fa-cog',
@@ -1664,11 +2051,19 @@ Ext.define('PVE.updmgr.SettingsWindow', {
     modal: true,
     resizable: true,
 
+    settingsUrl: function () {
+        let me = this;
+
+        return me.global
+            ? '/cluster/updatemgr/settings'
+            : `/nodes/${me.nodename}/updatemgr/settings`;
+    },
+
     load: function () {
         let me = this;
 
         Proxmox.Utils.API2Request({
-            url: `/nodes/${me.nodename}/updatemgr/settings`,
+            url: me.settingsUrl(),
             method: 'GET',
             waitMsgTarget: me,
             failure: function (response) {
@@ -1680,9 +2075,32 @@ Ext.define('PVE.updmgr.SettingsWindow', {
                 me.down('#parallelManual').setValue(!!data.parallel_manual);
                 me.down('#timeout').setValue(Math.round((data.timeout || 14400) / 60));
                 me.down('#startStopped').setValue(!!data.start_stopped);
+                me.down('#snapshotBefore').setValue(!!data.snapshot_before);
+                me.down('#snapshotKeep').setValue(data.snapshot_keep || 3);
+                // Hidden, not disabled, and decided by the server: a switch
+                // that is visible but can do nothing is a question the operator
+                // has to answer and then find out did not matter. What the
+                // server checks is every container's volumes, which is the only
+                // honest answer - "does the node have ZFS" is not the question.
+                // In global mode the answer is per node and there is no single
+                // one, so the fieldset stays visible: the setting is written
+                // everywhere and simply does nothing on the nodes that cannot.
+                me.down('#snapshots').setHidden(!me.global && !data.snapshot_capable);
                 me.down('#scheduleEnabled').setValue(!!data.schedule_enabled);
                 me.down('#scheduleTime').setValue(data.schedule_time);
                 me.down('#scheduleParallel').setValue(!!data.schedule_parallel);
+
+                if (me.global) {
+                    me.down('#scheduleHost').setValue(!!data.schedule_host);
+                    me.nodeCount = data.nodes;
+                    me.updateScope(data);
+                    // Only now. The load is asynchronous, and a Save pressed
+                    // before it came back would write the empty form to every
+                    // node in the cluster - which is the one mistake this
+                    // window is in a position to make.
+                    me.down('#save').setDisabled(false);
+                    return;
+                }
 
                 let selected = {};
                 if (data.schedule_host) {
@@ -1702,6 +2120,22 @@ Ext.define('PVE.updmgr.SettingsWindow', {
         });
     },
 
+    // What the bottom line says in global mode, where there is no single next
+    // run to report but there IS something more important: how many nodes this
+    // is about to change, and whether they currently agree.
+    updateScope: function (data) {
+        let me = this;
+
+        let text = Ext.String.format(
+            gettext('Saving writes these settings to all {0} nodes.'),
+            data.nodes,
+        );
+        if (!data.uniform) {
+            text += ` ${gettext('They do not all have the same settings today.')}`;
+        }
+        me.down('#nextrun').setText(text);
+    },
+
     updateNextRun: function (data) {
         let me = this;
 
@@ -1715,8 +2149,32 @@ Ext.define('PVE.updmgr.SettingsWindow', {
         me.down('#nextrun').setText(text);
     },
 
+    // What both modes have in common. The two that are missing here are exactly
+    // the two a datacenter-wide save may not carry: the ticked containers, which
+    // exist on one node only, and the host tick, which comes from the grid in
+    // per-node mode and from a plain checkbox in global mode.
+    commonParams: function () {
+        let me = this;
+
+        return {
+            parallel_manual: me.down('#parallelManual').getValue() ? 1 : 0,
+            timeout: me.down('#timeout').getValue() * 60,
+            start_stopped: me.down('#startStopped').getValue() ? 1 : 0,
+            snapshot_before: me.down('#snapshotBefore').getValue() ? 1 : 0,
+            snapshot_keep: me.down('#snapshotKeep').getValue(),
+            schedule_enabled: me.down('#scheduleEnabled').getValue() ? 1 : 0,
+            schedule_time: me.down('#scheduleTime').getValue(),
+            schedule_parallel: me.down('#scheduleParallel').getValue() ? 1 : 0,
+        };
+    },
+
     save: function () {
         let me = this;
+
+        if (me.global) {
+            me.saveGlobal();
+            return;
+        }
 
         let host = 0;
         let vmids = [];
@@ -1728,19 +2186,48 @@ Ext.define('PVE.updmgr.SettingsWindow', {
             }
         });
 
-        let params = {
-            parallel_manual: me.down('#parallelManual').getValue() ? 1 : 0,
-            timeout: me.down('#timeout').getValue() * 60,
-            start_stopped: me.down('#startStopped').getValue() ? 1 : 0,
-            schedule_enabled: me.down('#scheduleEnabled').getValue() ? 1 : 0,
-            schedule_time: me.down('#scheduleTime').getValue(),
-            schedule_parallel: me.down('#scheduleParallel').getValue() ? 1 : 0,
+        let params = Ext.apply(me.commonParams(), {
             schedule_host: host,
             schedule_vmids: vmids.join(','),
-        };
+        });
+
+        me.write(`/nodes/${me.nodename}/updatemgr/settings`, params);
+    },
+
+    // Asked before it happens, and the question counts the nodes out loud: this
+    // is the one save in the addon that changes a machine the operator is not
+    // looking at.
+    saveGlobal: function () {
+        let me = this;
+
+        let params = Ext.apply(me.commonParams(), {
+            schedule_host: me.down('#scheduleHost').getValue() ? 1 : 0,
+        });
+
+        Ext.Msg.confirm(
+            gettext('Confirm'),
+            Ext.String.format(
+                gettext(
+                    'Overwrite the Update Manager settings of all {0} nodes with what is'
+                        + ' shown here? Each node keeps its own selection of scheduled'
+                        + ' containers; everything else on this page replaces what that node'
+                        + ' has today.',
+                ),
+                me.nodeCount,
+            ),
+            function (btn) {
+                if (btn === 'yes') {
+                    me.write('/cluster/updatemgr/settings', params);
+                }
+            },
+        );
+    },
+
+    write: function (url, params) {
+        let me = this;
 
         Proxmox.Utils.API2Request({
-            url: `/nodes/${me.nodename}/updatemgr/settings`,
+            url: url,
             method: 'PUT',
             params: params,
             waitMsgTarget: me,
@@ -1756,7 +2243,10 @@ Ext.define('PVE.updmgr.SettingsWindow', {
     initComponent: function () {
         let me = this;
 
-        if (!me.nodename) {
+        // One window, two scopes. Global mode writes the same answers to every
+        // node at once - which is why it has a confirmation and a per-node save
+        // does not.
+        if (!me.global && !me.nodename) {
             throw 'no node name specified';
         }
 
@@ -1768,8 +2258,9 @@ Ext.define('PVE.updmgr.SettingsWindow', {
         }
 
         me.preselected = {};
+        me.nodeCount = 0;
 
-        me.targetGrid = Ext.create('Ext.grid.GridPanel', {
+        me.targetGrid = me.global ? undefined : Ext.create('Ext.grid.GridPanel', {
             // A fixed height, not flex: inside a scrolling body there is no
             // bounded height for a flex to divide up, so it would collapse to
             // nothing. This scrolls its own rows and the dialog scrolls around
@@ -1825,7 +2316,9 @@ Ext.define('PVE.updmgr.SettingsWindow', {
         });
 
         Ext.apply(me, {
-            title: Ext.String.format(gettext('Update Manager settings for {0}'), me.nodename),
+            title: me.global
+                ? gettext('Update Manager settings for all nodes')
+                : Ext.String.format(gettext('Update Manager settings for {0}'), me.nodename),
             items: [
                 {
                     xtype: 'panel',
@@ -1833,6 +2326,22 @@ Ext.define('PVE.updmgr.SettingsWindow', {
                     bodyPadding: 10,
                     scrollable: 'y',
                     items: [
+                        // Said before the fields rather than only in the
+                        // confirmation: somebody who opens this window to look
+                        // at a value should know what pressing Save would do
+                        // before they start changing things.
+                        me.global
+                            ? {
+                                  xtype: 'displayfield',
+                                  userCls: 'pmx-hint',
+                                  margin: '0 0 10 0',
+                                  value: gettext(
+                                      'These settings are written to EVERY node and replace'
+                                          + ' what each of them has. A node has no way to keep'
+                                          + ' its own answer to any of them.',
+                                  ),
+                              }
+                            : { xtype: 'container', height: 0 },
                         {
                             xtype: 'fieldset',
                             title: gettext('Limits'),
@@ -1891,6 +2400,45 @@ Ext.define('PVE.updmgr.SettingsWindow', {
                         },
                         {
                             xtype: 'fieldset',
+                            itemId: 'snapshots',
+                            title: gettext('Snapshots'),
+                            margin: '0 0 10 0',
+                            // Shown only where a container on this node could
+                            // actually be snapshotted - see the load() above.
+                            hidden: true,
+                            items: [
+                                {
+                                    xtype: 'checkbox',
+                                    itemId: 'snapshotBefore',
+                                    boxLabel: gettext(
+                                        'Take a snapshot of a container before updating it',
+                                    ),
+                                },
+                                {
+                                    xtype: 'proxmoxintegerfield',
+                                    itemId: 'snapshotKeep',
+                                    fieldLabel: gettext('Keep the last'),
+                                    labelWidth: 160,
+                                    minValue: 1,
+                                    maxValue: 100,
+                                    allowBlank: false,
+                                    emptyText: '3',
+                                },
+                                {
+                                    xtype: 'displayfield',
+                                    userCls: 'faded',
+                                    value: gettext(
+                                        'On by default: it is what makes a bad upgrade undoable.'
+                                            + ' Only snapshots taken by the Update Manager are ever'
+                                            + ' removed - one somebody made by hand is left alone.'
+                                            + ' A container whose storage cannot snapshot is updated'
+                                            + ' without one, and the run says so in its log.',
+                                    ),
+                                },
+                            ],
+                        },
+                        {
+                            xtype: 'fieldset',
                             title: gettext('Manual runs'),
                             margin: '0 0 10 0',
                             items: [
@@ -1940,7 +2488,33 @@ Ext.define('PVE.updmgr.SettingsWindow', {
                                     margin: '0 0 8 0',
                                     boxLabel: gettext('Update all targets in parallel'),
                                 },
-                                me.targetGrid,
+                                // Which containers a schedule runs is the one
+                                // answer that cannot be given for the whole
+                                // cluster - a vmid lives on exactly one node.
+                                // So global mode gets the host tick as a plain
+                                // checkbox and says where the rest is decided.
+                                me.global
+                                    ? {
+                                          xtype: 'checkbox',
+                                          itemId: 'scheduleHost',
+                                          margin: '0 0 8 0',
+                                          boxLabel: gettext(
+                                              "Include each node's own update script",
+                                          ),
+                                      }
+                                    : me.targetGrid,
+                                me.global
+                                    ? {
+                                          xtype: 'displayfield',
+                                          userCls: 'faded',
+                                          value: gettext(
+                                              'Which containers a node updates on its'
+                                                  + ' schedule stays that node\'s own setting -'
+                                                  + ' a container exists on one node only. Set it'
+                                                  + ' under Node → Update Manager → Settings.',
+                                          ),
+                                      }
+                                    : { xtype: 'container', height: 0 },
                             ],
                         },
                     ],
@@ -1957,7 +2531,12 @@ Ext.define('PVE.updmgr.SettingsWindow', {
                 },
                 {
                     text: gettext('Save'),
+                    itemId: 'save',
                     iconCls: 'fa fa-floppy-o',
+                    // Global mode only - see load(). A per-node save that came
+                    // in early costs one node its settings and is visible on the
+                    // page the operator is already looking at.
+                    disabled: !!me.global,
                     handler: function () {
                         me.save();
                     },
@@ -1975,9 +2554,9 @@ Ext.define('PVE.updmgr.NodePanel', {
     extend: 'PVE.updmgr.TargetGrid',
     alias: 'widget.pveUpdMgrNode',
 
-    // Only the node tab gets this. The container tab has a single target and no
-    // say over the node's timer; the datacenter tab spans nodes that each own
-    // their own settings.
+    // The container tab has a single target and no say over the node's timer, so
+    // it gets no Settings button. The datacenter tab gets one too - the same
+    // window in its global mode, see PVE.updmgr.DcPanel.
     showSettings: true,
 
     initComponent: function () {
@@ -2010,12 +2589,27 @@ Ext.define('PVE.updmgr.DcPanel', {
 
     showNodeColumn: true,
 
+    // The same button as on a node, pointed at every node at once. It is here
+    // and not only on the node tab because keeping twelve copies of the same
+    // four answers in step by hand is how they stop being in step.
+    showSettings: true,
+
     initComponent: function () {
         let me = this;
 
         me.targetsUrl = '/cluster/updatemgr/targets';
 
         me.callParent();
+    },
+
+    openSettings: function () {
+        let me = this;
+
+        let win = Ext.create('PVE.updmgr.SettingsWindow', { global: true });
+        win.on('destroy', function () {
+            me.reload();
+        });
+        win.show();
     },
 });
 
@@ -2086,6 +2680,131 @@ PVE.updmgr.injectTab = function (panel) {
     let idx = panel.items.findIndex((i) => i && i.itemId === 'summary');
     panel.items.splice(idx >= 0 ? idx + 1 : panel.items.length, 0, item);
 };
+
+// ── Throwing the stored commands away with the container ────────────────────
+//
+// A destroyed container leaves lxc-<vmid>.conf and lxc-<vmid>.state behind in
+// /etc/pve. That is not only clutter: Proxmox hands vmids out again, so the next
+// container created as 101 would inherit the update commands of the one that was
+// deleted - and its last-run record - without anybody having typed them.
+//
+// So the destroy dialog gets one more tick, on by default, and it is a tick
+// rather than an automatism because the files are also a legitimate thing to
+// keep: rebuilding a container under the same id and wanting its script back is
+// a real workflow.
+//
+// The dialog itself is Proxmox' PVE.window.SafeDestroyGuest. Nothing of it is
+// modified - the toolkit already offers both hooks this needs: `additionalItems`
+// for the checkbox and `apiCallDone` for the moment the destroy was accepted.
+PVE.updmgr.STORAGE_CHECKBOX = 'pveUpdMgrDropStored';
+
+// Where to send the cleanup, given the URL the destroy dialog was built with.
+//
+// Read back from the dialog rather than passed in, because this override has no
+// say in how the window was created - and matched strictly, because the same
+// window destroys VMs from `/nodes/<node>/qemu/<vmid>`, which has nothing stored
+// here and must produce no request at all.
+PVE.updmgr.destroyCleanupUrl = function (url) {
+    let match = String(url || '').match(/^\/nodes\/([^/]+)\/lxc\/(\d+)$/);
+    if (!match) {
+        return undefined;
+    }
+
+    // purge: the last-run record goes too. Keeping it would hand a container's
+    // update history to whatever is created with that vmid next.
+    return `/nodes/${match[1]}/lxc/${match[2]}/updatemgr/script?purge=1`;
+};
+
+Ext.define('PVE.updmgr.SafeDestroyGuestOverride', {
+    override: 'PVE.window.SafeDestroyGuest',
+
+    initComponent: function () {
+        let me = this;
+
+        // Everything this override does sits inside a try. The tab injection is
+        // wrapped for the same reason and the reason is stronger here: a throw
+        // in the tab costs a tab, a throw in THIS costs the ability to delete a
+        // guest at all, which is Proxmox' function and not ours to break.
+        try {
+            // Containers only. A VM has no update script here, and a tick
+            // offering to delete something that cannot exist is worse than none.
+            if ((me.getItem() || {}).type === 'CT') {
+                // concat, not push: additionalItems is on the prototype and is
+                // shared by every dialog this class ever opens. Pushing would
+                // add a checkbox per destroyed container, for ever.
+                me.additionalItems = (me.additionalItems || []).concat([
+                    {
+                        xtype: 'proxmoxcheckbox',
+                        itemId: PVE.updmgr.STORAGE_CHECKBOX,
+                        reference: PVE.updmgr.STORAGE_CHECKBOX,
+                        boxLabel: gettext('Also delete the stored update commands'),
+                        checked: true,
+                        autoEl: {
+                            tag: 'div',
+                            'data-qtip': gettext(
+                                'Removes this container from the Update Manager: its commands'
+                                    + ' and its last-run record. Without this they stay, and a'
+                                    + ' new container created with the same ID would inherit'
+                                    + ' them.',
+                            ),
+                        },
+                    },
+                ]);
+            }
+        } catch (err) {
+            console.error('pve-update-manager: could not add the cleanup checkbox', err);
+        }
+
+        me.callParent(arguments);
+    },
+
+    // Called the moment the destroy request came back - which is when the task
+    // has been STARTED, not when it has finished. That is the honest place for
+    // this: waiting for the task would mean this dialog stayed open watching a
+    // worker it does not own, and the alternative - deleting before the destroy
+    // is even accepted - would throw the commands away on a container the API
+    // then refused to remove.
+    apiCallDone: function (success, response, options) {
+        let me = this;
+
+        // Proxmox' own hook first and outside the try: whatever this override
+        // gets wrong must not stop the dialog from closing.
+        me.callParent(arguments);
+
+        try {
+            if (!success) {
+                return;
+            }
+
+            let box = me.lookupReference(PVE.updmgr.STORAGE_CHECKBOX);
+            if (!box || !box.checked) {
+                return;
+            }
+
+            let url = PVE.updmgr.destroyCleanupUrl(me.getUrl());
+            if (!url) {
+                return;
+            }
+
+            Proxmox.Utils.API2Request({
+                url: url,
+                method: 'DELETE',
+                failure: function (res) {
+                    // Not a dialog. The container is being destroyed either way
+                    // and this is tidying up after it; a message box here would
+                    // be an error about a file on top of an operation that
+                    // succeeded.
+                    console.error(
+                        'pve-update-manager: could not remove the stored update commands',
+                        res.htmlStatus,
+                    );
+                },
+            });
+        } catch (err) {
+            console.error('pve-update-manager: could not clean up after the destroy', err);
+        }
+    },
+});
 
 Ext.define('PVE.updmgr.ConfigPanelOverride', {
     override: 'PVE.panel.Config',

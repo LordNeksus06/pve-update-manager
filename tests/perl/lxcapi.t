@@ -9,7 +9,7 @@ use strict;
 use warnings;
 
 use File::Temp qw(tempdir);
-use Test::More tests => 24;
+use Test::More tests => 31;
 
 use PVE::LXC;
 use PVE::LXC::Config;
@@ -25,6 +25,8 @@ $PVE::UpdateManager::Config::BASE_DIR = "$dir/store";
 
 my $run = PVE::RESTHandler::registered('PVE::UpdateManager::LXCAPI', 'run');
 ok(ref($run) eq 'CODE', 'the run endpoint is registered');
+
+my $delete = PVE::RESTHandler::registered('PVE::UpdateManager::LXCAPI', 'delete_script');
 
 # Fresh books before each call: what matters is not only what came back, but
 # whether a Proxmox worker was started at all.
@@ -164,4 +166,62 @@ sub state_of {
 
     like($call->{error}, qr/not running/, 'a stopped container still says so to the caller');
     is(scalar(@{ $call->{forked} }), 0, 'and starts no worker');
+}
+
+# ── deleting what is stored for a container ─────────────────────────────────
+#
+# Two different operations behind one endpoint, and the difference matters. A
+# user clearing a container's commands is saying "no commands"; the destroy
+# dialog is saying "this container is gone". Only the second may take the
+# last-run record with it - and it MUST, because Proxmox hands vmids out again
+# and the next CT 301 would otherwise inherit this one's update history.
+{
+    PVE::UpdateManager::Config::save_script('lxc', 301, "apt-get update\n");
+    PVE::UpdateManager::Config::save_state(
+        'lxc', 301, { state => 'ok', started => 100, finished => 200, exit => 0 },
+    );
+
+    $delete->({ node => 'pve', vmid => 301 });
+
+    my ($script, $stored) = PVE::UpdateManager::Config::load_script('lxc', 301);
+    is($stored, 0, 'a plain delete removes the commands');
+    ok(
+        defined(PVE::UpdateManager::Config::load_state('lxc', 301)),
+        'and deliberately keeps the record of when it was last updated',
+    );
+}
+
+{
+    PVE::UpdateManager::Config::save_script('lxc', 302, "apt-get update\n");
+    PVE::UpdateManager::Config::save_state(
+        'lxc', 302, { state => 'ok', started => 100, finished => 200, exit => 0 },
+    );
+
+    $delete->({ node => 'pve', vmid => 302, purge => 1 });
+
+    my ($script, $stored) = PVE::UpdateManager::Config::load_script('lxc', 302);
+    is($stored, 0, 'purging removes the commands too');
+    is(
+        PVE::UpdateManager::Config::load_state('lxc', 302),
+        undef,
+        'and this time the last-run record goes with them',
+    );
+}
+
+# Nothing stored at all is not an error: the destroy dialog sends this for every
+# container, and most of them never had an update script.
+{
+    ok(
+        eval { $delete->({ node => 'pve', vmid => 303, purge => 1 }); 1 },
+        'purging a container that never had anything stored is quietly fine',
+    );
+}
+
+# The flag has to be off by default, or every Remove button in the editor would
+# silently be throwing the history away too.
+{
+    my $def = PVE::RESTHandler::registered_def('PVE::UpdateManager::LXCAPI', 'delete_script');
+
+    is($def->{parameters}->{properties}->{purge}->{default}, 0, 'purge is off unless asked for');
+    is($def->{parameters}->{properties}->{purge}->{optional}, 1, 'and it is optional');
 }

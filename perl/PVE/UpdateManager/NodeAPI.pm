@@ -18,6 +18,7 @@ use PVE::LXC;
 use PVE::LXC::Config;
 use PVE::RESTHandler;
 use PVE::RPCEnvironment;
+use PVE::Storage;
 
 use PVE::UpdateManager::Config;
 use PVE::UpdateManager::Job;
@@ -57,57 +58,17 @@ __PACKAGE__->register_method({
 
 # ── the node's settings ─────────────────────────────────────────────────────
 #
-# Deliberately only here. A container has no opinion about when it should be
+# The node is where they LIVE, and a run always follows the settings of the node
+# that owns the target. A container has no opinion about when it should be
 # updated and a cluster-wide schedule would have to pick a node to run it, so
 # this belongs to the node that owns the targets and whose timer will fire.
+#
+# /cluster/updatemgr/settings writes these same files on every node at once. It
+# is a convenience over this, not a second place where settings are kept - there
+# is no cluster-wide value anywhere, only twelve nodes that were told the same
+# thing.
 
-my $settings_properties = {
-    parallel_manual => {
-        type => 'boolean',
-        description => "Start all targets at once when Update Selected is pressed.",
-    },
-    timeout => {
-        type => 'integer',
-        minimum => $PVE::UpdateManager::Runner::MIN_TIMEOUT,
-        maximum => $PVE::UpdateManager::Runner::MAX_TIMEOUT,
-        description => "Kill a target's update after this many seconds. Applies to manual"
-            . " and scheduled runs alike. This really does kill the process tree, so it"
-            . " must sit above anything a real upgrade takes.",
-    },
-    start_stopped => {
-        type => 'boolean',
-        description => "Start a stopped container for its update and shut it down again"
-            . " afterwards. Off by default: a stopped container is skipped, because"
-            . " starting one runs its services for as long as the update takes.",
-    },
-    schedule_enabled => {
-        type => 'boolean',
-        description => "Run the selected targets on a schedule.",
-    },
-    schedule_time => {
-        type => 'string',
-        maxLength => 128,
-        description => "When to run, as a systemd calendar event - the same syntax as a"
-            . " backup job's schedule: '03:00', 'mon..fri 02:30', '*/8:00'.",
-    },
-    schedule_parallel => {
-        type => 'boolean',
-        description => "Start all targets at once on a scheduled run too.",
-    },
-    schedule_host => {
-        type => 'boolean',
-        description => "Include the node's own update script in scheduled runs.",
-    },
-    schedule_vmids => {
-        type => 'string',
-        # The empty string has to be allowed: it is how "no containers" is
-        # expressed, and without it the settings window could never have its last
-        # container unticked - Save would fail on the pattern.
-        pattern => '(\d+(,\d+)*)?',
-        maxLength => 4096,
-        description => "Comma separated container ids for scheduled runs. Empty for none.",
-    },
-};
+my $settings_properties = PVE::UpdateManager::Config::settings_schema();
 
 __PACKAGE__->register_method({
     name => 'get_settings',
@@ -138,6 +99,13 @@ __PACKAGE__->register_method({
                 optional => 1,
                 description => "When the schedule fires next. Absent while disabled.",
             },
+            snapshot_capable => {
+                type => 'boolean',
+                description => "Whether any container on this node sits on a storage that can"
+                    . " snapshot. False means the snapshot setting has nothing to act on here,"
+                    . " and the web interface leaves it out rather than offering a switch that"
+                    . " would do nothing.",
+            },
         },
     },
     code => sub {
@@ -153,6 +121,31 @@ __PACKAGE__->register_method({
             # time in the past.
             my $next = PVE::UpdateManager::Config::next_schedule_run($settings, time());
             $res->{next_run} = $next if defined($next);
+        }
+
+        # Asked per container rather than by looking at storage.cfg: whether a
+        # snapshot is possible depends on every volume a container has, so one
+        # mountpoint on a directory storage is enough to make the answer no -
+        # and a list of "storage types that can snapshot" kept here would be
+        # wrong the first time a plugin gained the feature.
+        # Never dies, all of it. This builds a settings dialog, and a storage.cfg
+        # or a guest list that cannot be read may cost the snapshot switch and a
+        # line in the syslog - it may not cost the operator the whole window.
+        $res->{snapshot_capable} = 0;
+
+        my $storecfg = eval { PVE::Storage::config() };
+        if (my $err = $@) {
+            chomp($err);
+            # Said once, here, rather than once per container from can_snapshot:
+            # that is the whole reason for reading it in this loop's caller.
+            warn "pve-update-manager: cannot read the storage configuration: $err\n";
+        }
+
+        my $list = eval { PVE::LXC::config_list() } || {};
+        for my $vmid (keys %$list) {
+            next if !PVE::UpdateManager::Runner::can_snapshot($vmid, $storecfg);
+            $res->{snapshot_capable} = 1;
+            last;
         }
 
         return $res;
@@ -432,7 +425,7 @@ __PACKAGE__->register_method({
         # move it.
         my $settings = PVE::UpdateManager::Config::load_settings($node);
         my $timeout = $param->{timeout} // $settings->{timeout};
-        my $opts = { start_stopped => $settings->{start_stopped} };
+        my $opts = PVE::UpdateManager::Config::run_opts($settings);
 
         my $targets = [];
 

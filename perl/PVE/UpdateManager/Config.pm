@@ -46,6 +46,15 @@ sub _ensure_base_dir {
     die "unable to create '$BASE_DIR' - $err\n";
 }
 
+# The public half of the same thing, for the modules that store something beside
+# the per-target files - the template list, which has no target and so no
+# script_file() call to create the directory as a side effect.
+sub ensure_base_dir {
+    _ensure_base_dir();
+
+    return $BASE_DIR;
+}
+
 sub script_file {
     my ($type, $id) = @_;
 
@@ -340,11 +349,24 @@ sub settings_file {
     return $file;
 }
 
+our $DEFAULT_SNAPSHOT_KEEP = 3;
+
+# One is the floor and not zero: keeping none would delete the snapshot the run
+# had just taken, which is the opposite of what the setting is for.
+our $MIN_SNAPSHOT_KEEP = 1;
+our $MAX_SNAPSHOT_KEEP = 100;
+
+# snapshot_before is the one switch here that starts ON. Every other one changes
+# what a run DOES and so has to be asked for; this one only adds something to
+# undo it with, and it does nothing at all where the storage cannot snapshot - so
+# for once the cautious default and the useful one are the same value.
 sub default_settings {
     return {
         parallel_manual => 0,
         timeout => $PVE::UpdateManager::Runner::DEFAULT_TIMEOUT,
         start_stopped => 0,
+        snapshot_before => 1,
+        snapshot_keep => $DEFAULT_SNAPSHOT_KEEP,
         schedule_enabled => 0,
         schedule_time => '03:00',
         schedule_parallel => 0,
@@ -352,6 +374,94 @@ sub default_settings {
         schedule_vmids => '',
         last_run => 0,
     };
+}
+
+# The API's description of the settings, in ONE place. The node's endpoint and
+# the datacenter-wide one both describe the same switches, and two copies of a
+# minimum, a pattern or a sentence of documentation drift apart the first time
+# one of them is corrected.
+sub settings_schema {
+    return {
+        parallel_manual => {
+            type => 'boolean',
+            description => "Start all targets at once when Update Selected is pressed.",
+        },
+        timeout => {
+            type => 'integer',
+            minimum => $PVE::UpdateManager::Runner::MIN_TIMEOUT,
+            maximum => $PVE::UpdateManager::Runner::MAX_TIMEOUT,
+            description => "Kill a target's update after this many seconds. Applies to manual"
+                . " and scheduled runs alike. This really does kill the process tree, so it"
+                . " must sit above anything a real upgrade takes.",
+        },
+        start_stopped => {
+            type => 'boolean',
+            description => "Start a stopped container for its update and shut it down again"
+                . " afterwards. Off by default: a stopped container is skipped, because"
+                . " starting one runs its services for as long as the update takes.",
+        },
+        snapshot_before => {
+            type => 'boolean',
+            description => "Take a snapshot of a container before updating it. On by default,"
+                . " because it is the one thing that makes a bad dist-upgrade undoable - and it"
+                . " does nothing at all where the storage cannot snapshot, in which case the"
+                . " container is updated exactly as it was before this setting existed.",
+        },
+        snapshot_keep => {
+            type => 'integer',
+            minimum => $MIN_SNAPSHOT_KEEP,
+            maximum => $MAX_SNAPSHOT_KEEP,
+            description => "How many of these snapshots to keep per container. The oldest ones"
+                . " above this are removed after each run. Only snapshots this addon took are"
+                . " ever touched.",
+        },
+        schedule_enabled => {
+            type => 'boolean',
+            description => "Run the selected targets on a schedule.",
+        },
+        schedule_time => {
+            type => 'string',
+            maxLength => 128,
+            description => "When to run, as a systemd calendar event - the same syntax as a"
+                . " backup job's schedule: '03:00', 'mon..fri 02:30', '*/8:00'.",
+        },
+        schedule_parallel => {
+            type => 'boolean',
+            description => "Start all targets at once on a scheduled run too.",
+        },
+        schedule_host => {
+            type => 'boolean',
+            description => "Include the node's own update script in scheduled runs.",
+        },
+        schedule_vmids => {
+            type => 'string',
+            # The empty string has to be allowed: it is how "no containers" is
+            # expressed, and without it the settings window could never have its last
+            # container unticked - Save would fail on the pattern.
+            pattern => '(\d+(,\d+)*)?',
+            maxLength => 4096,
+            description => "Comma separated container ids for scheduled runs. Empty for none.",
+        },
+    };
+}
+
+# The keys a datacenter-wide save may write: everything that means the same
+# thing on every node.
+#
+# schedule_vmids is the one that does not, and it is why "apply to all nodes"
+# cannot simply be a loop over this whole hash: a vmid lives on exactly one
+# node, so broadcasting one node's list would point every other node at
+# containers it does not have - and un-tick the ones it does.
+#
+# last_run is not here either: it belongs to the scheduler, like everywhere else.
+our @PER_NODE_SETTINGS = qw(schedule_vmids last_run);
+
+sub global_settings_schema {
+    my $schema = settings_schema();
+
+    delete $schema->{$_} for @PER_NODE_SETTINGS;
+
+    return $schema;
 }
 
 sub load_settings {
@@ -382,6 +492,14 @@ sub load_settings {
             $secs = $PVE::UpdateManager::Runner::MAX_TIMEOUT
                 if $secs > $PVE::UpdateManager::Runner::MAX_TIMEOUT;
             $res->{$key} = $secs;
+        } elsif ($key eq 'snapshot_keep') {
+            # Clamped rather than rejected, same reason as the timeout: a file
+            # edited by hand into a 0 would delete the snapshot the run had just
+            # taken, which is the opposite of what the setting is for.
+            my $keep = ($value =~ m/\A\d+\z/) ? int($value) : $res->{$key};
+            $keep = $MIN_SNAPSHOT_KEEP if $keep < $MIN_SNAPSHOT_KEEP;
+            $keep = $MAX_SNAPSHOT_KEEP if $keep > $MAX_SNAPSHOT_KEEP;
+            $res->{$key} = $keep;
         } elsif ($key eq 'schedule_vmids') {
             $res->{$key} = ($value =~ m/\A\d+(?:,\d+)*\z/) ? $value : '';
         } elsif ($key eq 'schedule_time') {
@@ -449,6 +567,14 @@ sub save_settings {
         || $secs < $PVE::UpdateManager::Runner::MIN_TIMEOUT
         || $secs > $PVE::UpdateManager::Runner::MAX_TIMEOUT;
 
+    my $keep = $merged->{snapshot_keep};
+    die "invalid snapshot count '$keep' - must be between $MIN_SNAPSHOT_KEEP"
+        . " and $MAX_SNAPSHOT_KEEP\n"
+        if !defined($keep)
+        || $keep !~ m/\A\d+\z/
+        || $keep < $MIN_SNAPSHOT_KEEP
+        || $keep > $MAX_SNAPSHOT_KEEP;
+
     return _write_settings($node, $merged);
 }
 
@@ -485,6 +611,22 @@ sub next_schedule_run {
     my $next = eval { PVE::CalendarEvent::compute_next_event($event, $since) };
 
     return $@ ? undef : $next;
+}
+
+# What a run does, taken from the node's settings, in ONE place.
+#
+# There are three callers - the node's run endpoint, a container's, and the
+# timer - and an option added to two of them is a scheduled run that quietly
+# behaves differently from the manual one somebody tested with. That has
+# happened once already, which is why this exists rather than three literals.
+sub run_opts {
+    my ($settings) = @_;
+
+    return {
+        start_stopped => $settings->{start_stopped},
+        snapshot_before => $settings->{snapshot_before},
+        snapshot_keep => $settings->{snapshot_keep},
+    };
 }
 
 # Is a scheduled run due? Kept here rather than in the timer's script so the API

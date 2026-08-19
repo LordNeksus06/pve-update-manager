@@ -17,11 +17,17 @@ UNITDIR := $(DESTDIR)$(PREFIX)/lib/systemd/system
 DOCDIR := $(DESTDIR)$(PREFIX)/share/doc/$(PKG)
 
 PERL_MODULES := $(wildcard perl/PVE/UpdateManager/*.pm)
-SHELL_SCRIPTS := tools/pve-update-manager-hooks tools/github-mirror.sh \
+# github-mirror.sh through $(wildcard ...) on purpose: it is the publishing tool
+# and does not go out with the published tree, so on a checkout that does not
+# have it shellcheck must not be handed a path that is not there.
+SHELL_SCRIPTS := tools/pve-update-manager-hooks $(wildcard tools/github-mirror.sh) \
                  packaging/build-deb.sh tests/run-tests.sh \
                  packaging/debian/postinst packaging/debian/prerm packaging/debian/postrm
 PERL_SCRIPTS := tools/pve-update-manager-schedule
-JS_TESTS := $(wildcard tests/js/*.test.js)
+# Every .js under tests/, not only the *.test.js the suite runs: harness.js is
+# shared by all of them and a syntax error in it would fail every test at once
+# with a message about the wrong file.
+JS_TESTS := $(wildcard tests/js/*.js)
 
 .PHONY: all check test install deb clean version
 

@@ -77,19 +77,25 @@ done
 # into a V8 context carrying a stub ExtJS. What it LOOKS like cannot, and no
 # amount of this replaces opening the page once.
 echo
-# Every top-level entry has to be classified as published or withheld before it
-# can be added, not on the day somebody pushes the mirror. This is the check that
-# would have caught `.gitea/` and CLAUDE.md going to GitHub.
-check "the mirror knows what may be published" bash "$REPO_ROOT/tools/github-mirror.sh" check
+# The publishing tool checks itself, where it exists: it is not part of what it
+# publishes, so a checkout can legitimately be without it and these two checks
+# then have nothing to run against.
+if [ -f "$REPO_ROOT/tools/github-mirror.sh" ]; then
+    # Every top-level entry has to be classified as published or withheld before
+    # it can be added, not on the day somebody publishes. This is the check that
+    # would have caught `.gitea/` and CLAUDE.md going out.
+    check "the publishing tool knows what may be published" \
+        bash "$REPO_ROOT/tools/github-mirror.sh" check
 
-# And the scans it refuses on: a scanner nobody has watched fail is a scanner
-# nobody knows the shape of. Its own fixtures, its own verdict.
-if out="$(bash "$REPO_ROOT/tools/github-mirror.sh" selftest 2>&1)"; then
-    ok "the mirror catches addresses and credentials before publishing"
-else
-    bad "the mirror catches addresses and credentials before publishing"
-    # shellcheck disable=SC2001  # indenting every line of a captured block
-    echo "$out" | sed 's/^/       /'
+    # And the scans it refuses on: a scanner nobody has watched fail is a scanner
+    # nobody knows the shape of. Its own fixtures, its own verdict.
+    if out="$(bash "$REPO_ROOT/tools/github-mirror.sh" selftest 2>&1)"; then
+        ok "the scans catch addresses and credentials before publishing"
+    else
+        bad "the scans catch addresses and credentials before publishing"
+        # shellcheck disable=SC2001  # indenting every line of a captured block
+        echo "$out" | sed 's/^/       /'
+    fi
 fi
 
 echo "== web interface"

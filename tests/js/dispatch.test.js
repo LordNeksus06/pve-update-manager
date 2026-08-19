@@ -1,9 +1,9 @@
 // PVE.updmgr.dispatch - what pressing Update on a pile of targets puts on screen.
 //
-// The interface file is written for a browser, so it is loaded here into a V8
-// context carrying just enough of ExtJS and Proxmox to let it run: the point is
-// to exercise the real js/pve-update-manager.js, not a second copy of its logic
-// that can drift away from it.
+// The interface file is loaded into a V8 context carrying just enough of ExtJS
+// and Proxmox to let it run: the point is to exercise the real
+// js/pve-update-manager.js, not a second copy of its logic that can drift away
+// from it. The loader itself lives in harness.js, shared with the other tests.
 //
 //   node tests/js/dispatch.test.js
 //
@@ -12,71 +12,9 @@
 'use strict';
 
 const assert = require('assert');
-const fs = require('fs');
-const path = require('path');
-const vm = require('vm');
+const { load, runner } = require('./harness.js');
 
-const repoRoot = path.resolve(__dirname, '..', '..');
-const source = fs.readFileSync(path.join(repoRoot, 'js', 'pve-update-manager.js'), 'utf8');
-
-// Loads the interface file with a fake API behind it.
-//
-// `answer(url)` returns what the server says for one request: a UPID string for
-// a task that was started, '' for a target the server skipped without starting
-// one, or {failure: '...'} for a request that came back as an error.
-function load(answer) {
-    const sandbox = {};
-    const alerts = [];
-
-    const stubs = {
-        console: console,
-        gettext: (s) => s,
-        Ext: {
-            ns: function (name) {
-                let node = sandbox;
-                for (const part of name.split('.')) {
-                    node[part] = node[part] || {};
-                    node = node[part];
-                }
-                return node;
-            },
-            define: function () {},
-            getStore: function () {},
-            Msg: {
-                alert: function (title, msg) {
-                    alerts.push({ title: title, msg: msg });
-                },
-            },
-            String: {
-                format: function (fmt, ...args) {
-                    return fmt.replace(/\{(\d+)\}/g, (_m, i) => args[i]);
-                },
-                htmlEncode: (s) => String(s),
-            },
-        },
-        Proxmox: {
-            Utils: {
-                override_task_descriptions: function () {},
-                API2Request: function (req) {
-                    const res = answer(req.url);
-                    if (res && res.failure !== undefined) {
-                        req.failure({ htmlStatus: res.failure });
-                    } else {
-                        req.success({ result: { data: res } });
-                    }
-                },
-            },
-        },
-        PVE: { Utils: {} },
-    };
-
-    Object.assign(sandbox, stubs);
-    sandbox.globalThis = sandbox;
-
-    vm.runInNewContext(source, sandbox, { filename: 'js/pve-update-manager.js' });
-
-    return { updmgr: sandbox.PVE.updmgr, alerts: alerts };
-}
+const { claim, done } = runner();
 
 function containers(count) {
     const targets = [];
@@ -84,18 +22,6 @@ function containers(count) {
         targets.push({ type: 'lxc', vmid: 100 + i, node: 'pve', name: `ct${100 + i}` });
     }
     return targets;
-}
-
-let failures = 0;
-function claim(description, fn) {
-    try {
-        fn();
-        console.log(`  ok   ${description}`);
-    } catch (err) {
-        failures += 1;
-        console.log(`  FAIL ${description}`);
-        console.log(String(err.message).replace(/^/gm, '       '));
-    }
 }
 
 // The case this exists for: forty containers, twelve of them with nothing
@@ -178,4 +104,4 @@ claim('serial mode still gets its one task per node', () => {
     assert.strictEqual(alerts.length, 0);
 });
 
-process.exit(failures === 0 ? 0 : 1);
+done();

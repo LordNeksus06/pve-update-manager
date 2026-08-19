@@ -37,9 +37,9 @@ if ($cmd ne 'run' && $cmd ne 'status') {
 my $nodename = PVE::INotify::nodename();
 my $settings = PVE::UpdateManager::Config::load_settings($nodename);
 
-# The same options a manual run gets, so an unattended run does not quietly
-# behave differently from the one the operator tried by hand.
-my $opts = { start_stopped => $settings->{start_stopped} };
+# The same options a manual run gets, from the same function, so an unattended
+# run cannot quietly behave differently from the one the operator tried by hand.
+my $opts = PVE::UpdateManager::Config::run_opts($settings);
 
 # Everything the schedule points at, in the order the manual runs use.
 sub collect_targets {

@@ -214,6 +214,89 @@ sub run_one {
 
     my ($logfunc, $report) = _capped_logger($MAX_OUTPUT_BYTES);
 
+    # ── the rollback point ──────────────────────────────────────────────────
+    #
+    # Before the config lock below, not after: snapshot_create takes its own
+    # lock and PVE refuses one while another is held, so the guard would defeat
+    # the thing it is guarding. Before the container is started, too, when it
+    # was found stopped - the state somebody left it in is the cleaner thing to
+    # roll back to.
+    #
+    # Only where the storage really can. Where it cannot the run goes ahead
+    # exactly as it did before this setting existed: a container on a directory
+    # storage is not one to refuse to update.
+    # Asked before the snapshot and not only by lock_guest below: a container
+    # whose nightly backup overlaps the update window is skipped every single
+    # run, and snapshotting it first would leave one snapshot per attempt behind
+    # - which the pruning below cannot clear either, because removing a snapshot
+    # takes a config lock too and that is exactly what is not available.
+    #
+    # A check-then-act, deliberately. lock_guest stays the real guard; this only
+    # keeps the common case from paying for a snapshot nobody can use.
+    my $foreign_lock = $target->{type} eq 'lxc'
+        ? eval { PVE::LXC::Config->load_config($target->{id})->{lock} }
+        : undef;
+
+    if (defined($foreign_lock) && length($foreign_lock)) {
+        my $note = "another task holds the lock ($foreign_lock)";
+        _set_state(
+            $target,
+            {
+                state => 'skipped', upid => $upid, started => $started,
+                finished => time(), note => $note,
+            },
+        );
+        return (undef, $note);
+    }
+
+    my $snapshot;
+    if ($target->{type} eq 'lxc' && $opts->{snapshot_before}) {
+        if (!PVE::UpdateManager::Runner::can_snapshot($target->{id})) {
+            _log('the storage of this container cannot snapshot - updating without one');
+        } else {
+            $snapshot = eval {
+                PVE::UpdateManager::Runner::snapshot_lxc($target->{id}, $logfunc, $started);
+            };
+
+            if (!defined($snapshot)) {
+                # A failure, not a warning, and deliberately different from "the
+                # storage cannot do it": the storage said it could and then did
+                # not. The usual reason is a full thin pool, which is the exact
+                # situation where continuing into a dist-upgrade is worst.
+                my $err = $@ // '';
+                chomp($err);
+                my $note = "could not be snapshotted before the update - $err";
+                _set_state(
+                    $target,
+                    {
+                        state => 'failed', upid => $upid, started => $started,
+                        finished => time(), exit => -1, note => $note,
+                    },
+                );
+                # Nothing to give back: the config lock below has not been taken
+                # yet, which is the whole reason the snapshot happens here.
+                return (-1, $note);
+            }
+        }
+    }
+
+    # Every exit from here on has to prune, not only the one at the bottom. A run
+    # that snapshots and then returns early - the lock taken in the gap above,
+    # a container that will not start - would otherwise add one snapshot per
+    # attempt and never drop any, and snapshot_keep would quietly mean nothing.
+    my $prune = sub {
+        return if !defined($snapshot);
+
+        # The count is spelled out rather than left to prune_snapshots' own
+        # floor of one: a caller that asked for a snapshot and forgot to say how
+        # many to keep would otherwise lose every earlier one on the first run.
+        PVE::UpdateManager::Runner::prune_snapshots(
+            $target->{id},
+            $opts->{snapshot_keep} // $PVE::UpdateManager::Config::DEFAULT_SNAPSHOT_KEEP,
+            $logfunc,
+        );
+    };
+
     # Proxmox refuses to stop, shut down, reboot or migrate a locked guest -
     # every one of those paths calls check_lock - so the lock is all it takes to
     # keep a container from being switched off in the middle of its own
@@ -237,6 +320,7 @@ sub run_one {
                     finished => time(), note => $note,
                 },
             );
+            $prune->();
             return (undef, $note);
         }
     }
@@ -263,6 +347,7 @@ sub run_one {
             # on the way out - an early return that keeps it would leave the
             # container unstoppable until somebody found `pct unlock`.
             PVE::UpdateManager::Runner::unlock_guest($target->{id}, $logfunc) if $locked;
+            $prune->();
             return (-1, 'could not be started for the update');
         }
 
@@ -300,6 +385,13 @@ sub run_one {
         _log('WARNING: the container could not be stopped again') if $shutdown_failed;
     }
 
+    # After the container is back the way it was found, and after the lock is
+    # given back - snapshot_delete takes a lock of its own too. Housekeeping, so
+    # it happens whether the update worked or not: what it keeps is the NEWEST
+    # snapshots, this run's included, and a failed run is the one whose rollback
+    # point matters most.
+    $prune->();
+
     my $finished = time();
     my $elapsed = $finished - $started;
 
@@ -330,8 +422,16 @@ sub run_one {
         finished => $finished,
         exit => $rc,
     };
+    # The snapshot is named on the row only when the run went wrong. That is the
+    # one moment somebody needs to know which snapshot to roll back to, and it is
+    # the moment the task log is least likely to still be the thing being read.
+    $note .= ", snapshot $snapshot" if defined($snapshot) && $rc != 0;
+
     $state->{note} = $note
-        if $dropped || $shutdown_failed || $rc == $PVE::UpdateManager::Runner::TIMEOUT_RC;
+        if $dropped
+        || $shutdown_failed
+        || (defined($snapshot) && $rc != 0)
+        || $rc == $PVE::UpdateManager::Runner::TIMEOUT_RC;
 
     _set_state($target, $state);
 
