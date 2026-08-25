@@ -29,6 +29,14 @@ function load(answer, options) {
     const sandbox = {};
     const alerts = [];
     const requests = [];
+    // Every Ext.define the file makes, by class name. The panels and grids are
+    // plain config objects until ExtJS builds them, and their methods are
+    // ordinary functions - so a test can call one against a stand-in `me` and
+    // check what the interface DECIDES, which is as close to clicking a button
+    // as this can get without a browser.
+    const classes = {};
+    // Every Ext.create the interface makes, in order: {xclass, config}.
+    const created = [];
 
     const stubs = {
         console: console,
@@ -42,9 +50,28 @@ function load(answer, options) {
                 }
                 return node;
             },
-            define: function () {},
-            create: function (xclass) {
-                return { show: function () {}, xclass: xclass };
+            define: function (name, config) {
+                classes[name] = config;
+            },
+            // The config is recorded, not only the class: what a window is built
+            // WITH is the interesting half - which node's endpoint an editor was
+            // pointed at is a decision, and in a cluster it is the difference
+            // between reading the right machine and the one you happen to be
+            // connected to.
+            //
+            // `on` because every window the interface opens gets a listener hung
+            // on it - a task viewer that reloads the grid when it is closed.
+            // Without it here, a test that drives a path as far as opening one
+            // fails on the stub rather than on the interface.
+            create: function (xclass, config) {
+                created.push({ xclass: xclass, config: config || {} });
+
+                return {
+                    show: function () {},
+                    on: function () {},
+                    xclass: xclass,
+                    config: config || {},
+                };
             },
             getStore: function () {},
             Msg: {
@@ -54,12 +81,29 @@ function load(answer, options) {
                 confirm: function (title, msg, cb) {
                     alerts.push({ title: title, msg: msg, confirm: cb });
                 },
+                prompt: function (title, msg, cb, scope, multiline, value) {
+                    alerts.push({
+                        title: title, msg: msg, prompt: cb, value: value,
+                        multiline: multiline,
+                    });
+                },
             },
             String: {
                 format: function (fmt, ...args) {
                     return fmt.replace(/\{(\d+)\}/g, (_m, i) => args[i]);
                 },
-                htmlEncode: (s) => String(s),
+                // The real one, not an identity function: everything the
+                // interface puts into a cell or a menu entry goes through it,
+                // and a stub that hands the string back unchanged makes every
+                // claim about escaping untestable - the test would pass just as
+                // happily against code that had stopped calling it.
+                htmlEncode: (s) =>
+                    String(s)
+                        .replace(/&/g, '&amp;')
+                        .replace(/</g, '&lt;')
+                        .replace(/>/g, '&gt;')
+                        .replace(/"/g, '&quot;')
+                        .replace(/'/g, '&#39;'),
             },
             state: {
                 Manager: {
@@ -72,6 +116,12 @@ function load(answer, options) {
         Proxmox: {
             Utils: {
                 override_task_descriptions: function () {},
+                // Deterministic on purpose: what the tests check is which
+                // timestamp an entry carries, not how a browser locale renders
+                // it.
+                render_timestamp: function (epoch) {
+                    return `ts:${epoch}`;
+                },
                 API2Request: function (req) {
                     requests.push(req);
                     const res = answer(req.url, req);
@@ -91,7 +141,13 @@ function load(answer, options) {
 
     vm.runInNewContext(source, sandbox, { filename: 'js/pve-update-manager.js' });
 
-    return { updmgr: sandbox.PVE.updmgr, alerts: alerts, requests: requests };
+    return {
+        updmgr: sandbox.PVE.updmgr,
+        classes: classes,
+        created: created,
+        alerts: alerts,
+        requests: requests,
+    };
 }
 
 // Named as claims, so a failure reads as a sentence about the interface.

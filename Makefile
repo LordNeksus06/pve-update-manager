@@ -12,11 +12,18 @@ PKG := pve-update-manager
 
 PERLDIR := $(DESTDIR)$(PREFIX)/share/perl5/PVE/UpdateManager
 JSDIR := $(DESTDIR)$(PREFIX)/share/pve-manager/js
+# Where Proxmox looks for the text of a notification. Read off libpve_rs.so on
+# PVE 9.2 (the only template root compiled into it) rather than guessed, and it
+# is pve-manager's directory rather than ours for the same reason the JavaScript
+# above lives in pve-manager's: this addon extends that package's interface, and
+# a template in a directory nothing reads is a notification that fails to render.
+TPLDIR := $(DESTDIR)$(PREFIX)/share/pve-manager/templates/default
 SBINDIR := $(DESTDIR)$(PREFIX)/sbin
 UNITDIR := $(DESTDIR)$(PREFIX)/lib/systemd/system
 DOCDIR := $(DESTDIR)$(PREFIX)/share/doc/$(PKG)
 
 PERL_MODULES := $(wildcard perl/PVE/UpdateManager/*.pm)
+NOTIFY_TEMPLATES := $(wildcard packaging/notification-templates/*.hbs)
 # github-mirror.sh through $(wildcard ...) on purpose: it is the publishing tool
 # and does not go out with the published tree, so on a checkout that does not
 # have it shellcheck must not be handed a path that is not there.
@@ -64,6 +71,8 @@ install:
 	install -m 0644 $(PERL_MODULES) $(PERLDIR)
 	install -d $(JSDIR)
 	install -m 0644 js/pve-update-manager.js $(JSDIR)
+	install -d $(TPLDIR)
+	install -m 0644 $(NOTIFY_TEMPLATES) $(TPLDIR)
 	install -d $(SBINDIR)
 	install -m 0755 tools/pve-update-manager-hooks $(SBINDIR)/pve-update-manager-hooks
 	install -m 0755 tools/pve-update-manager-schedule $(SBINDIR)/pve-update-manager-schedule

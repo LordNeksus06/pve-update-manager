@@ -9,7 +9,7 @@ use strict;
 use warnings;
 
 use File::Temp qw(tempdir);
-use Test::More tests => 31;
+use Test::More tests => 54;
 
 use PVE::LXC;
 use PVE::LXC::Config;
@@ -224,4 +224,154 @@ sub state_of {
 
     is($def->{parameters}->{properties}->{purge}->{default}, 0, 'purge is off unless asked for');
     is($def->{parameters}->{properties}->{purge}->{optional}, 1, 'and it is optional');
+}
+
+# ── the history behind the editor's History button ──────────────────────────
+{
+    my $versions = PVE::RESTHandler::registered('PVE::UpdateManager::LXCAPI', 'script_versions');
+    my $version = PVE::RESTHandler::registered('PVE::UpdateManager::LXCAPI', 'script_version');
+    my $set = PVE::RESTHandler::registered('PVE::UpdateManager::LXCAPI', 'set_script');
+
+    ok(ref($versions) eq 'CODE' && ref($version) eq 'CODE', 'both endpoints are registered');
+
+    $set->({ node => 'pve', vmid => 401, script => "first\n" });
+    $set->({ node => 'pve', vmid => 401, script => "second\n" });
+
+    my $list = $versions->({ node => 'pve', vmid => 401 });
+    is(scalar(@$list), 2, 'a save through the API is a version');
+    is(
+        $list->[0]->{user},
+        'root@pam',
+        'attributed to whoever made the request, which is the only place that knows',
+    );
+
+    is(
+        $version->({ node => 'pve', vmid => 401, version => $list->[1]->{version} })->{script},
+        "first\n",
+        'and the older text can be read back',
+    );
+
+    ok(
+        !defined(eval { $version->({ node => 'pve', vmid => 401, version => 1 }) }),
+        'a version that does not exist is refused by name rather than answered with nothing',
+    );
+}
+
+# A purge takes the history with it - the container itself is going, and keeping
+# it would hand somebody else's commands to whatever gets that vmid next.
+{
+    my $set = PVE::RESTHandler::registered('PVE::UpdateManager::LXCAPI', 'set_script');
+    my $versions = PVE::RESTHandler::registered('PVE::UpdateManager::LXCAPI', 'script_versions');
+
+    $set->({ node => 'pve', vmid => 402, script => "gone soon\n" });
+    PVE::UpdateManager::Config::save_order('lxc', 402, 5);
+
+    $delete->({ node => 'pve', vmid => 402 });
+    is(
+        scalar(@{ $versions->({ node => 'pve', vmid => 402 }) }),
+        1,
+        'removing the commands keeps the history, which is what makes that undoable',
+    );
+    is(PVE::UpdateManager::Config::load_order('lxc', 402), 5, 'and the position in a run');
+
+    $delete->({ node => 'pve', vmid => 402, purge => 1 });
+    is(
+        scalar(@{ $versions->({ node => 'pve', vmid => 402 }) }),
+        0,
+        'a purge takes the history',
+    );
+    is(PVE::UpdateManager::Config::load_order('lxc', 402), 0, 'and the position with it');
+}
+
+# ── where the container sits in a serial run ────────────────────────────────
+{
+    my $order = PVE::RESTHandler::registered('PVE::UpdateManager::LXCAPI', 'set_order');
+    ok(ref($order) eq 'CODE', 'the order endpoint is registered');
+
+    $order->({ node => 'pve', vmid => 403, order => 7 });
+    is(PVE::UpdateManager::Config::load_order('lxc', 403), 7, 'a number is stored');
+
+    $order->({ node => 'pve', vmid => 403, order => 0 });
+    is(PVE::UpdateManager::Config::load_order('lxc', 403), 0, 'and a zero clears it');
+
+    my $def = PVE::RESTHandler::registered_def('PVE::UpdateManager::LXCAPI', 'set_order');
+    is($def->{permissions}->{check}->[2]->[0], 'VM.Config.Options',
+        'changing it takes the privilege that changing the commands takes');
+}
+
+# ── running is not the same privilege as storing ────────────────────────────
+#
+# The endpoint runs with VM.Console, which is the right level: console access
+# already means arbitrary root commands inside this container. Its optional
+# `script` parameter, though, SAVES - and what is saved is what the node's
+# schedule runs again later with nobody watching. That is VM.Config.Options,
+# here as everywhere else.
+{
+    $PVE::LXC::RUNNING{501} = 4711;
+    PVE::UpdateManager::Config::save_script('lxc', 501, "the stored one\n");
+
+    local $PVE::RPCEnvironment::CHECK = sub {
+        my ($path, $privs) = @_;
+        return !(grep { $_ eq 'VM.Config.Options' } @$privs);
+    };
+
+    my $call = call_run(vmid => 501, script => "somebody else's commands\n");
+
+    ok($call->{error}, 'a console user may not store a script through the run endpoint');
+    is(scalar(@{ $call->{forked} }), 0, 'and no task is started for it');
+
+    my ($stored) = PVE::UpdateManager::Config::load_script('lxc', 501);
+    is($stored, "the stored one\n", 'what was there is untouched');
+}
+
+# Without the parameter the same user runs what is stored, which is what
+# VM.Console is for.
+{
+    local $PVE::RPCEnvironment::CHECK = sub {
+        my ($path, $privs) = @_;
+        return !(grep { $_ eq 'VM.Config.Options' } @$privs);
+    };
+
+    my $call = call_run(vmid => 501);
+
+    is($call->{error}, '', 'running the stored script still works');
+    is(scalar(@{ $call->{forked} }), 1, 'and it really starts a task');
+}
+
+# ── a vmid that is not a container on this node ─────────────────────────────
+#
+# The scripts live in /etc/pve and are the same on every node, so a container
+# that has migrated away is found here with its commands intact. Answering "not
+# running" would be true of this node's cgroups and wrong about the container,
+# and it invites the one fix that cannot work - starting it.
+{
+    $PVE::LXC::RUNNING{601} = undef;
+    PVE::UpdateManager::Config::save_script('lxc', 601, "apt-get update\n");
+    local %PVE::LXC::Config::NO_CONFIG = (601 => 1);
+
+    my $call = call_run(vmid => 601);
+
+    like(
+        $call->{error},
+        qr/not a container on node pve/,
+        'the caller is told what is actually the case',
+    );
+    is(scalar(@{ $call->{forked} }), 0, 'and no task is started to find it out in');
+}
+
+# A template is refused with the reason, not with advice that cannot work: the
+# "not running" answer invites turning on 'start stopped containers', and PVE
+# refuses to start a template at all.
+{
+    $PVE::LXC::RUNNING{602} = undef;
+    PVE::UpdateManager::Config::save_script('lxc', 602, "apt-get update\n");
+    $PVE::LXC::Config::CONFIGS{602} = { template => 1 };
+
+    my $call = call_run(vmid => 602);
+
+    like($call->{error}, qr/is a template/, 'the caller is told it is a template');
+    unlike($call->{error} // '', qr/start stopped/, 'and not sent after a setting that cannot help');
+    is(scalar(@{ $call->{forked} }), 0, 'no task is started');
+
+    delete $PVE::LXC::Config::CONFIGS{602};
 }

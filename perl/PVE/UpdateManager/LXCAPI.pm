@@ -11,6 +11,7 @@ use warnings;
 use PVE::Exception qw(raise_param_exc);
 use PVE::JSONSchema qw(get_standard_option);
 use PVE::LXC;
+use PVE::LXC::Config;
 use PVE::RESTHandler;
 use PVE::RPCEnvironment;
 
@@ -42,7 +43,9 @@ __PACKAGE__->register_method({
         links => [{ rel => 'child', href => '{name}' }],
     },
     code => sub {
-        return [{ name => 'script' }, { name => 'run' }];
+        return [
+            { name => 'script' }, { name => 'run' }, { name => 'order' }, { name => 'logs' },
+        ];
     },
 });
 
@@ -121,7 +124,155 @@ __PACKAGE__->register_method({
     code => sub {
         my ($param) = @_;
 
-        PVE::UpdateManager::Config::save_script('lxc', $param->{vmid}, $param->{script});
+        my $rpcenv = PVE::RPCEnvironment::get();
+
+        PVE::UpdateManager::Config::save_script(
+            'lxc', $param->{vmid}, $param->{script}, $rpcenv->get_user(),
+        );
+
+        return undef;
+    },
+});
+
+# ── the previous versions of that script ────────────────────────────────────
+#
+# Two endpoints rather than one that carries the text of every version: the
+# retention goes up to 50 and a script up to 64 KiB, and a list nobody has
+# picked from yet has no business being three megabytes.
+
+__PACKAGE__->register_method({
+    name => 'script_versions',
+    path => 'script/versions',
+    method => 'GET',
+    protected => 1,
+    proxyto => 'node',
+    description => "List the saved versions of a container's update script, newest first.",
+    permissions => {
+        check => ['perm', '/vms/{vmid}', ['VM.Audit']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            vmid => get_standard_option('pve-vmid'),
+        },
+    },
+    returns => {
+        type => 'array',
+        items => {
+            type => 'object',
+            properties => {
+                version => {
+                    type => 'string',
+                    maxLength => 32,
+                    description => "How this version is asked for, and what stands in its"
+                        . " filename: the local second it was saved at,"
+                        . " '2026-08-21-13-21-12'. Versions saved before that shape existed"
+                        . " are a plain epoch instead, and are still listed and readable.",
+                },
+                time => {
+                    type => 'integer',
+                    description => "The same moment as a unix timestamp, for rendering. Kept"
+                        . " apart from the identifier: an epoch is not what somebody reading"
+                        . " a directory wants, and a formatted local time is not something to"
+                        . " do arithmetic on.",
+                },
+                user => {
+                    type => 'string',
+                    optional => 1,
+                    description => "Who saved it. Absent for a version written before this"
+                        . " was recorded, or by something that did not go through the API.",
+                },
+                size => { type => 'integer' },
+            },
+        },
+    },
+    code => sub {
+        my ($param) = @_;
+
+        return PVE::UpdateManager::Config::list_versions('lxc', $param->{vmid});
+    },
+});
+
+__PACKAGE__->register_method({
+    name => 'script_version',
+    path => 'script/versions/{version}',
+    method => 'GET',
+    protected => 1,
+    proxyto => 'node',
+    description => "The text of one saved version. Restoring it is a normal save of that"
+        . " text, which is why there is no endpoint for it here.",
+    permissions => {
+        check => ['perm', '/vms/{vmid}', ['VM.Audit']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            vmid => get_standard_option('pve-vmid'),
+            version => {
+                type => 'string',
+                # Exactly the two shapes version_file() accepts - the local
+                # second a save is named after, or the epoch an older save was
+                # named after. Bounded here as well so anything else is a
+                # parameter error rather than an exception out of the path
+                # builder.
+                pattern => '[0-9]{4}(-[0-9]{2}){5}|[0-9]{1,12}',
+                maxLength => 32,
+                description => "The version, as listed by the endpoint above.",
+            },
+        },
+    },
+    returns => {
+        type => 'object',
+        properties => {
+            script => { type => 'string' },
+        },
+    },
+    code => sub {
+        my ($param) = @_;
+
+        my $script =
+            PVE::UpdateManager::Config::load_version('lxc', $param->{vmid}, $param->{version});
+
+        raise_param_exc({ version => "no such version" }) if !defined($script);
+
+        return { script => $script };
+    },
+});
+
+# ── where this container sits in a run ──────────────────────────────────────
+
+__PACKAGE__->register_method({
+    name => 'set_order',
+    path => 'order',
+    method => 'PUT',
+    protected => 1,
+    proxyto => 'node',
+    description => "Set the position of this container in a serial update run.",
+    permissions => {
+        check => ['perm', '/vms/{vmid}', ['VM.Config.Options']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            vmid => get_standard_option('pve-vmid'),
+            order => {
+                type => 'integer',
+                minimum => 0,
+                maximum => $PVE::UpdateManager::Config::MAX_ORDER,
+                description => "Lower goes first. Containers with the same number are"
+                    . " updated by ascending vmid. 0 means no answer given, and those go"
+                    . " after everything that has one.",
+            },
+        },
+    },
+    returns => { type => 'null' },
+    code => sub {
+        my ($param) = @_;
+
+        PVE::UpdateManager::Config::save_order('lxc', $param->{vmid}, $param->{order});
 
         return undef;
     },
@@ -147,11 +298,12 @@ __PACKAGE__->register_method({
                 type => 'boolean',
                 optional => 1,
                 default => 0,
-                description => "Also delete the recorded last run. Off by default, because"
+                description => "Also delete the recorded last run, the saved versions,"
+                    . " the update order and the kept run logs. Off by default, because"
                     . " removing a target's commands is not the same as forgetting when it"
                     . " was last updated - the two columns say different things and both"
-                    . " stay true after a delete. The destroy dialog sets it: keeping a"
-                    . " record for a container that no longer exists would hand it to"
+                    . " stay true after a delete. The destroy dialog sets it: keeping any"
+                    . " of it for a container that no longer exists would hand it to"
                     . " whatever is created with that vmid next.",
             },
         },
@@ -163,9 +315,132 @@ __PACKAGE__->register_method({
         my $vmid = $param->{vmid};
 
         PVE::UpdateManager::Config::delete_script('lxc', $vmid);
-        PVE::UpdateManager::Config::delete_state('lxc', $vmid) if $param->{purge};
+
+        # The history survives a delete, exactly like the recorded last run: what
+        # this container ran last week stays true whether or not commands are
+        # stored for it now, and it is the one thing that makes a delete
+        # undoable. A purge is the destroy dialog, and there the container itself
+        # is going - keeping either would hand it to whatever gets that vmid next.
+        if ($param->{purge}) {
+            PVE::UpdateManager::Config::delete_state('lxc', $vmid);
+            PVE::UpdateManager::Config::delete_versions('lxc', $vmid);
+            PVE::UpdateManager::Config::delete_order('lxc', $vmid);
+            # The kept run logs too, and for the same reason: a log of what CT
+            # 101 did last week, handed to whatever is created as 101 next, is
+            # somebody else's history in somebody else's editor.
+            PVE::UpdateManager::Config::delete_logs('lxc', $vmid);
+        }
 
         return undef;
+    },
+});
+
+__PACKAGE__->register_method({
+    name => 'logs',
+    path => 'logs',
+    method => 'GET',
+    protected => 1,
+    proxyto => 'node',
+    description => "List the kept logs of this container's past runs, newest first."
+        . " They live on the node that ran them, not in /etc/pve - a run log can be far"
+        . " larger than the 1 MiB a file there may be. How many are kept is the node's"
+        . " `run_logs` setting.",
+    permissions => {
+        check => ['perm', '/vms/{vmid}', ['VM.Audit']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            vmid => get_standard_option('pve-vmid'),
+        },
+    },
+    returns => {
+        type => 'array',
+        items => {
+            type => 'object',
+            properties => {
+                log => {
+                    type => 'string',
+                    maxLength => 32,
+                    description => "How this log is asked for, and what stands in its"
+                        . " filename: the local second the run finished at.",
+                },
+                time => {
+                    type => 'integer',
+                    description => "The same moment as a unix timestamp, for rendering.",
+                },
+                size => { type => 'integer' },
+                state => {
+                    type => 'string',
+                    optional => 1,
+                    enum => ['ok', 'failed', 'skipped'],
+                    description => "How that run ended, read from the log's own header."
+                        . " Absent for a log that has none - one a killed worker left half"
+                        . " written.",
+                },
+                note => {
+                    type => 'string',
+                    optional => 1,
+                    description => "What the verdict said beyond the state - the exit code,"
+                        . " the snapshot, a rollback.",
+                },
+                upid => {
+                    type => 'string',
+                    optional => 1,
+                    description => "The task that produced this log. Proxmox' own log for it"
+                        . " is richer while it lasts; it stops being reachable once its entry"
+                        . " falls out of the task index, which is why this copy exists.",
+                },
+            },
+        },
+    },
+    code => sub {
+        my ($param) = @_;
+
+        return PVE::UpdateManager::Config::list_logs('lxc', $param->{vmid});
+    },
+});
+
+__PACKAGE__->register_method({
+    name => 'log',
+    path => 'logs/{log}',
+    method => 'GET',
+    protected => 1,
+    proxyto => 'node',
+    description => "The text of one kept run log. This is the addon's own copy: Proxmox'"
+        . " task log stays on disk but stops being reachable once its entry falls out of"
+        . " the task index, and this one is pruned on purpose instead.",
+    permissions => {
+        check => ['perm', '/vms/{vmid}', ['VM.Audit']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            vmid => get_standard_option('pve-vmid'),
+            log => {
+                type => 'string',
+                pattern => '[0-9]{4}(-[0-9]{2}){5}',
+                maxLength => 32,
+                description => "The log, as listed by the endpoint above.",
+            },
+        },
+    },
+    returns => {
+        type => 'object',
+        properties => {
+            log => { type => 'string' },
+        },
+    },
+    code => sub {
+        my ($param) = @_;
+
+        my $text = PVE::UpdateManager::Config::load_log('lxc', $param->{vmid}, $param->{log});
+
+        raise_param_exc({ log => "no such run log" }) if !defined($text);
+
+        return { log => $text };
     },
 });
 
@@ -192,8 +467,12 @@ __PACKAGE__->register_method({
                 type => 'string',
                 optional => 1,
                 maxLength => $PVE::UpdateManager::Config::MAX_SCRIPT_SIZE,
-                description => "Store this script first, then run it. The UI sends the text box"
-                    . " content here so pressing Update never runs a stale version.",
+                description => "Store this script first, then run it - a convenience for a"
+                    . " caller that would otherwise make two requests. Sending it needs"
+                    . " VM.Config.Options on top of VM.Console, because it is a save like"
+                    . " any other: what is stored is what the node's schedule runs later,"
+                    . " unattended. The web interface does not use it; it saves through PUT"
+                    . " and then runs, so pressing Update never runs a stale version either.",
             },
             timeout => {
                 type => 'integer',
@@ -217,11 +496,20 @@ __PACKAGE__->register_method({
         # it runs on, which is where the Settings dialog lives.
         my $settings = PVE::UpdateManager::Config::load_settings($param->{node});
         my $timeout = $param->{timeout} // $settings->{timeout};
+        # No parallel flag: this endpoint runs exactly one container, and one
+        # target is one wave whichever way the node's switch is set.
         my $opts = PVE::UpdateManager::Config::run_opts($settings);
 
         if (defined(my $script = $param->{script})) {
+            # Running is VM.Console; STORING is VM.Config.Options, here as
+            # everywhere else. Console access already means arbitrary root
+            # commands inside this container, so the run itself is not what this
+            # guards - what it guards is leaving them behind, where the node's
+            # schedule will run them again with nobody watching.
+            $rpcenv->check($authuser, "/vms/$vmid", ['VM.Config.Options']);
+
             raise_param_exc({ script => "must not be empty" }) if $script !~ m/\S/;
-            PVE::UpdateManager::Config::save_script('lxc', $vmid, $script);
+            PVE::UpdateManager::Config::save_script('lxc', $vmid, $script, $authuser);
         }
 
         # FIRST, before anything below writes anything. The worker checks this
@@ -234,6 +522,23 @@ __PACKAGE__->register_method({
         # was harmless while everything here only raised.
         die "CT $vmid is already being updated\n"
             if PVE::UpdateManager::Config::target_is_running('lxc', $vmid);
+
+        # The same rule the worker follows, checked here for the same reason
+        # everything else in this endpoint is: the caller gets a plain error
+        # instead of a task that has to be opened to find out why it did
+        # nothing. The scripts live in /etc/pve and are found wherever this
+        # request lands, so a container that has migrated away - or a vmid that
+        # names a VM - would otherwise be turned away as "not running", which is
+        # true here and wrong everywhere else.
+        my $conf = eval { PVE::LXC::Config->load_config($vmid) };
+        die "CT $vmid is not a container on node $param->{node}\n" if !$conf;
+
+        # And a template is not one either. Without this the answer below is
+        # "not running - enable 'start stopped containers' to update it anyway",
+        # which is advice that cannot work: PVE refuses to start a template and
+        # refuses to snapshot one.
+        die "CT $vmid is a template - there is nothing to update\n"
+            if PVE::LXC::Config->is_template($conf);
 
         # Nothing stored is a SKIP, not an error - and it is recorded on the
         # container's own row rather than raised.

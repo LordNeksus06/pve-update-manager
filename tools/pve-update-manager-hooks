@@ -294,14 +294,18 @@ cmd_revert() {
 
         remove_hook_line "$f"
 
-        case "$f" in
-            /usr/bin/*)
-                if ! perl -Tc "$f" >/dev/null 2>&1; then
-                    warn "$f does not compile after removing the hook - restoring the backup"
-                    restore_backup "$f" || warn "no backup for $f, fix it by hand"
-                fi
-                ;;
-        esac
+        # Every file that is not the template is a Perl entry point, and one
+        # that no longer compiles is a Proxmox API that will not start. Keyed on
+        # "is it the template" like everywhere else in this script, and not on
+        # the path: the paths are overridable, and a guard that only runs when
+        # they happen to start with /usr/bin is a guard the test suite never
+        # exercises - which is how it stops being a guard.
+        if [ "$f" != "$TPL" ]; then
+            if ! perl -Tc "$f" >/dev/null 2>&1; then
+                warn "$f does not compile after removing the hook - restoring the backup"
+                restore_backup "$f" || warn "no backup for $f, fix it by hand"
+            fi
+        fi
 
         msg "hook removed from $f"
     done

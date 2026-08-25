@@ -36,6 +36,11 @@ PVE.updmgr.TAB_ICON = 'fa fa-arrow-circle-o-up';
 // through a whole dist-upgrade.
 PVE.updmgr.RUNNING_POLL_MS = 3000;
 
+// The ceiling the API puts on a target's position in a run. Rejected
+// here as well so a typo is a message in the prompt rather than a request that
+// comes back red.
+PVE.updmgr.MAX_ORDER = 99999;
+
 // Without this the task log shows the raw worker type ("ctupdate 101"). The
 // helper is the toolkit's own extension point for product specific task types.
 if (typeof Proxmox !== 'undefined' && Proxmox.Utils && Proxmox.Utils.override_task_descriptions) {
@@ -99,7 +104,11 @@ PVE.updmgr.canManageTemplates = function () {
 PVE.updmgr.templateMenuItems = function (data, apply, onManage) {
     let items = (data.templates || []).map(function (tpl) {
         return {
-            text: tpl.name,
+            // A template name is free text somebody with Sys.Modify on / typed,
+            // and a menu item's text is rendered as HTML. Reading the menu takes
+            // no privilege at all, so an unescaped name here is markup planted
+            // in every logged-in user's browser.
+            text: Ext.String.htmlEncode(tpl.name),
             handler: function () {
                 apply(tpl.script);
             },
@@ -184,6 +193,134 @@ PVE.updmgr.scriptUrlFor = function (data, defaultNode) {
         : `/nodes/${node}/lxc/${data.vmid}/updatemgr/script`;
 };
 
+// Where a target's position in a run is written. Same shape as
+// scriptUrlFor and for the same reason: a datacenter selection spans nodes.
+PVE.updmgr.orderUrlFor = function (data, defaultNode) {
+    let node = data.node || defaultNode;
+    if (!node) {
+        return undefined;
+    }
+
+    return data.type === 'node'
+        ? `/nodes/${node}/updatemgr/order`
+        : `/nodes/${node}/lxc/${data.vmid}/updatemgr/order`;
+};
+
+// Where a target's kept run logs live. Same shape as orderUrlFor and for the same
+// reason: a datacenter selection spans nodes, and a log is the one thing here that
+// is NOT replicated - so an URL pointing at the wrong node answers with an empty
+// list rather than an error.
+PVE.updmgr.logsUrlFor = function (data, defaultNode) {
+    let node = data.node || defaultNode;
+    if (!node) {
+        return undefined;
+    }
+
+    return data.type === 'node'
+        ? `/nodes/${node}/updatemgr/logs`
+        : `/nodes/${node}/lxc/${data.vmid}/updatemgr/logs`;
+};
+
+// What the operator typed into the order prompt, as the API wants it.
+//
+// Returns 0 for an empty box - that is how "no answer given" is spelled, and it
+// is what clears the value - and undefined for anything that is not a plain
+// number in range, which the caller reports rather than sending.
+PVE.updmgr.parseOrder = function (text) {
+    let raw = String(text === undefined || text === null ? '' : text).trim();
+
+    if (!raw.length) {
+        return 0;
+    }
+    if (!/^\d+$/.test(raw)) {
+        return undefined;
+    }
+
+    let value = parseInt(raw, 10);
+
+    return value <= PVE.updmgr.MAX_ORDER ? value : undefined;
+};
+
+// The menu behind the History button: one entry per saved version of the
+// script, newest first, as the server listed them.
+//
+// "latest save" and not "current": the file in /etc/pve can be edited with an
+// editor, and that write goes through nothing that could record a version - so
+// the newest entry is the newest SAVE, which is a claim this can actually make.
+PVE.updmgr.versionMenuItems = function (list, apply) {
+    let items = (list || []).map(function (entry, index) {
+        let who = entry.user ? ` — ${Ext.String.htmlEncode(entry.user)}` : '';
+        let tag = index === 0 ? ` (${gettext('latest save')})` : '';
+
+        return {
+            // `time` to show, `version` to ask with. They used to be the same
+            // number; the identifier is the local second that stands in the
+            // file's name now, and rendering that as though it were an epoch
+            // would date every entry to 1970.
+            text: `${Proxmox.Utils.render_timestamp(entry.time)}${who}${tag}`,
+            handler: function () {
+                apply(entry.version, entry.time);
+            },
+        };
+    });
+
+    // A menu that opens empty reads as broken.
+    if (!items.length) {
+        items.push({ text: gettext('Nothing saved yet'), disabled: true });
+    }
+
+    return items;
+};
+
+// One row of the Logs window: how a past run ended.
+//
+// The same shape renderLastRun draws a row's state in, on purpose - a run that
+// failed has to look the same in both places. `state` is absent for a log a
+// killed worker left half written, which is worth saying rather than drawing as
+// "ok".
+PVE.updmgr.renderLogState = function (state, note) {
+    let faded = note ? ` <span class="faded">${Ext.String.htmlEncode(note)}</span>` : '';
+
+    switch (state) {
+        case 'ok':
+            return `<i class="fa fa-check good"></i> ${gettext('OK')}${faded}`;
+        case 'failed':
+            return `<i class="fa fa-times critical"></i> ${gettext('failed')}${faded}`;
+        case 'skipped':
+            return `<i class="fa fa-minus"></i> ${gettext('skipped')}${faded}`;
+        default:
+            return `<i class="fa fa-question-circle warning"></i> ${gettext('no result')}`;
+    }
+};
+
+// The Logs button, as a config rather than inline - so a test can hold it and
+// check that it is a plain BUTTON.
+//
+// That is not fussiness: it used to be two buttons, one of them a dropdown, and
+// between them they pushed the end of the editor's toolbar into ExtJS' overflow
+// menu. A `menu:` added here again would put it straight back, and nothing else in
+// the suite would notice.
+PVE.updmgr.logsButton = function (open) {
+    return {
+        text: gettext('Logs'),
+        iconCls: 'fa fa-file-text-o',
+        handler: function () {
+            open();
+        },
+    };
+};
+
+// How big a log is, for the column that says "this run said a lot" before it is
+// opened. Proxmox' own formatter where the version at hand has one - it did not
+// always - and plain bytes otherwise, because a number is better than nothing.
+PVE.updmgr.formatLogSize = function (bytes) {
+    if (Proxmox.Utils.format_size) {
+        return Proxmox.Utils.format_size(bytes || 0);
+    }
+
+    return `${bytes || 0} B`;
+};
+
 // One line summarising a target's last run, used both in a grid cell and in the
 // toolbar of the container tab. The state comes from the state file the worker
 // writes, not from the task archive, so it survives log rotation.
@@ -206,7 +343,16 @@ PVE.updmgr.renderLastRun = function (data) {
         case 'failed':
             return (
                 `<i class="fa fa-times critical"></i> ` +
-                Ext.String.format(gettext('failed (exit {0})'), data.last_exit) +
+                // '?' rather than the raw value: a state file that lost its exit
+                // code - hand-edited, or written by something that is not us -
+                // would otherwise put the word "undefined" in the grid, which
+                // reads as a bug in the addon rather than as a missing number.
+                Ext.String.format(
+                    gettext('failed (exit {0})'),
+                    data.last_exit === undefined || data.last_exit === null
+                        ? '?'
+                        : data.last_exit,
+                ) +
                 faded
             );
         case 'skipped':
@@ -229,6 +375,194 @@ PVE.updmgr.renderLastRun = function (data) {
     }
 };
 
+// The Logs window: the kept runs of one target, and what each of them printed.
+//
+// ONE window and one plain button behind it, not a dropdown and not two buttons.
+// The editor's toolbar already carries six and ExtJS was folding the end of it
+// into an overflow menu - and "Last Log" was a second button for a third of the
+// same thing anyway. So the newest row IS the last run, and Proxmox' own task log
+// for it is a button in here.
+//
+// The grid is deliberately small and the text pane large: picking which run is a
+// glance, reading what it said is the job.
+Ext.define('PVE.updmgr.LogWindow', {
+    extend: 'Ext.window.Window',
+    alias: 'widget.pveUpdMgrLogWindow',
+
+    // `/nodes/<node>/(lxc/<vmid>/)?updatemgr/logs`
+    logsUrl: undefined,
+    // The last run's task, from the target's state file. Kept even when no logs
+    // are: switching run_logs off must not take the way to Proxmox' own log with
+    // it, which is what the old Last Log button did.
+    lastUpid: undefined,
+    targetLabel: '',
+
+    width: 900,
+    height: 640,
+    layout: 'border',
+    modal: true,
+
+    // Loads the list, then selects the newest - so opening the window already
+    // shows the run somebody came here for. A target that has never run gets an
+    // empty grid and a text pane that says so, rather than a blank box.
+    reloadLogs: function () {
+        let me = this;
+
+        Proxmox.Utils.API2Request({
+            url: me.logsUrl,
+            method: 'GET',
+            waitMsgTarget: me,
+            failure: function (response) {
+                Ext.Msg.alert(gettext('Error'), response.htmlStatus);
+            },
+            success: function (response) {
+                let rows = response.result.data || [];
+                me.grid.getStore().loadData(rows);
+
+                if (!rows.length) {
+                    me.setLogText(gettext('No run has been logged for this target yet.'));
+                    return;
+                }
+
+                me.grid.getSelectionModel().select(0);
+            },
+        });
+    },
+
+    setLogText: function (text) {
+        let me = this;
+
+        me.textPane.setValue(text);
+    },
+
+    showLog: function (rec) {
+        let me = this;
+
+        me.taskButton.setDisabled(!rec.data.upid);
+        me.selectedUpid = rec.data.upid;
+
+        Proxmox.Utils.API2Request({
+            url: `${me.logsUrl}/${encodeURIComponent(rec.data.log)}`,
+            method: 'GET',
+            waitMsgTarget: me,
+            failure: function (response) {
+                me.setLogText(response.htmlStatus);
+            },
+            success: function (response) {
+                me.setLogText(response.result.data.log);
+            },
+        });
+    },
+
+    initComponent: function () {
+        let me = this;
+
+        if (!me.logsUrl) {
+            throw 'no logsUrl specified';
+        }
+
+        me.title = Ext.String.format(gettext('Logs of {0}'), me.targetLabel || '');
+
+        me.textPane = Ext.create('Ext.form.field.TextArea', {
+            readOnly: true,
+            hideLabel: true,
+            fieldStyle: {
+                'font-family': 'monospace',
+                'font-size': '12px',
+                'white-space': 'pre',
+                'overflow-wrap': 'normal',
+                'overflow-x': 'auto',
+            },
+        });
+
+        // Opens Proxmox' own task log - of the selected run where that run
+        // recorded one, and of the last run otherwise. That second case is what
+        // keeps this reachable with run_logs switched off, where there are no
+        // rows to select at all.
+        me.taskButton = Ext.create('Ext.Button', {
+            text: gettext('Proxmox Task Log'),
+            iconCls: 'fa fa-list-alt',
+            disabled: !me.lastUpid,
+            handler: function () {
+                PVE.updmgr.showLog(me.selectedUpid || me.lastUpid);
+            },
+        });
+
+        me.grid = Ext.create('Ext.grid.Panel', {
+            region: 'north',
+            height: 200,
+            split: true,
+            border: false,
+            store: Ext.create('Ext.data.Store', {
+                fields: [
+                    'log',
+                    'state',
+                    'note',
+                    'upid',
+                    { name: 'time', type: 'int' },
+                    { name: 'size', type: 'int' },
+                ],
+                data: [],
+            }),
+            columns: [
+                {
+                    header: gettext('When'),
+                    dataIndex: 'time',
+                    width: 160,
+                    renderer: (v) => Proxmox.Utils.render_timestamp(v),
+                },
+                {
+                    header: gettext('Result'),
+                    dataIndex: 'state',
+                    flex: 1,
+                    renderer: (v, meta, rec) => PVE.updmgr.renderLogState(v, rec.data.note),
+                },
+                {
+                    header: gettext('Size'),
+                    dataIndex: 'size',
+                    width: 100,
+                    renderer: (v) => PVE.updmgr.formatLogSize(v),
+                },
+            ],
+            listeners: {
+                selectionchange: function (sm, selected) {
+                    if (selected.length) {
+                        me.showLog(selected[0]);
+                    }
+                },
+            },
+        });
+
+        Ext.apply(me, {
+            tbar: [
+                me.taskButton,
+                '->',
+                {
+                    text: gettext('Reload'),
+                    iconCls: 'fa fa-refresh',
+                    handler: function () {
+                        me.reloadLogs();
+                    },
+                },
+            ],
+            items: [
+                me.grid,
+                {
+                    region: 'center',
+                    xtype: 'panel',
+                    layout: 'fit',
+                    border: false,
+                    items: [me.textPane],
+                },
+            ],
+        });
+
+        me.callParent();
+
+        me.reloadLogs();
+    },
+});
+
 PVE.updmgr.showLog = function (upid) {
     if (!upid) {
         Ext.Msg.alert(gettext('Error'), gettext('This target has not been run yet.'));
@@ -237,101 +571,100 @@ PVE.updmgr.showLog = function (upid) {
     Ext.create('Proxmox.window.TaskViewer', { upid: upid }).show();
 };
 
-// The endpoint that runs exactly one target, and the task type it produces.
+// The endpoint that runs exactly one CONTAINER, and the task type it produces:
+// `ctupdate` with the vmid as its id, so the task list says "CT 102 - Update
+// Manager" instead of labelling it as a job on the node.
+//
+// Containers only. The host has no endpoint of its own - updating it is the node
+// endpoint with host=1 - and a branch here for a case nothing reaches would only
+// suggest there was one. dispatch() is the single caller and it calls this for
+// one container on its own; everything else goes to the node.
 PVE.updmgr.runUrlFor = function (data, defaultNode) {
     let node = data.node || defaultNode;
-    if (!node) {
+    if (!node || data.type === 'node') {
         return undefined;
     }
 
-    let label = PVE.updmgr.targetLabel(data);
-
-    return data.type === 'node'
-        ? { url: `/nodes/${node}/updatemgr/run`, params: { host: 1 }, node: node, label: label }
-        : {
-              url: `/nodes/${node}/lxc/${data.vmid}/updatemgr/run`,
-              params: {},
-              node: node,
-              label: label,
-          };
+    return {
+        url: `/nodes/${node}/lxc/${data.vmid}/updatemgr/run`,
+        params: {},
+        node: node,
+        label: PVE.updmgr.targetLabel(data),
+    };
 };
 
 // Starts the update of a set of targets.
 //
-// Two shapes, and the difference is real work, not a label:
+// One request per node, whichever way that node updates. The request becomes ONE
+// Proxmox task that works through that node's share of the selection: one target
+// at a time, or a whole update-order position at a time where the node is set to
+// update in parallel. Which of the two happens is the node's own setting and is
+// decided on the node, not here.
 //
-//   parallel   one request per target, so every target gets its own Proxmox
-//              worker and they all run at the same time. A row's task is then
-//              that row's task - "CT 102 - Update Manager" - and its log holds
-//              nothing but its own output.
-//   serial     targets are grouped by the node that owns them and one request
-//              goes out per node. Each node works through its share one after
-//              another, in a single task with a banner per target and a summary
-//              at the end. Several NODES still run at the same time; it is the
-//              targets within a node that queue up.
+// It used to be one request per TARGET for a parallel run, and that is what this
+// replaces. Two things were wrong with it. The update order did nothing, because
+// no task ever saw more than one target to put in an order - and it cannot be
+// fixed from here either: waiting for one position to finish before starting the
+// next would mean a browser tab holding the run together, and a tab that is
+// closed mid-run would take the rest of the order with it. And nothing knew when
+// the run as a whole was finished, which is what a notification about it needs.
+//
+// Several NODES still run at the same time; it is the targets within one node
+// that its task puts in order.
 //
 // `callback` gets the list of started tasks once every request has answered.
-PVE.updmgr.dispatch = function (targets, defaultNode, parallel, callback) {
+PVE.updmgr.dispatch = function (targets, defaultNode, callback) {
     let requests = [];
+    let byNode = {};
 
-    if (parallel) {
-        targets.forEach(function (data) {
-            let req = PVE.updmgr.runUrlFor(data, defaultNode);
+    targets.forEach(function (data) {
+        let node = data.node || defaultNode;
+        if (!node) {
+            return;
+        }
+        if (!byNode[node]) {
+            byNode[node] = { host: 0, vmids: [], single: undefined };
+        }
+        if (data.type === 'node') {
+            byNode[node].host = 1;
+        } else {
+            byNode[node].vmids.push(data.vmid);
+            // Kept for the one-container case below, which needs the record and
+            // not just the vmid.
+            byNode[node].single = data;
+        }
+    });
+
+    Object.keys(byNode).forEach(function (node) {
+        let group = byNode[node];
+
+        if (!group.host && group.vmids.length === 1) {
+            // One container on its own goes to its own endpoint. Same work
+            // either way, but the task is then typed `ctupdate` with the vmid as
+            // its id, so the task list says "CT 102 - Update Manager" instead of
+            // labelling it as a job on the node - indistinguishable from
+            // updating the host itself.
+            let req = PVE.updmgr.runUrlFor(group.single, defaultNode);
             if (req) {
                 requests.push(req);
             }
+            return;
+        }
+
+        let params = {};
+        if (group.vmids.length) {
+            params.vmids = group.vmids.join(',');
+        }
+        if (group.host) {
+            params.host = 1;
+        }
+        requests.push({
+            url: `/nodes/${node}/updatemgr/run`,
+            params: params,
+            node: node,
+            label: node,
         });
-    } else {
-        let byNode = {};
-
-        targets.forEach(function (data) {
-            let node = data.node || defaultNode;
-            if (!node) {
-                return;
-            }
-            if (!byNode[node]) {
-                byNode[node] = { host: 0, vmids: [] };
-            }
-            if (data.type === 'node') {
-                byNode[node].host = 1;
-            } else {
-                byNode[node].vmids.push(data.vmid);
-            }
-        });
-
-        Object.keys(byNode).forEach(function (node) {
-            let group = byNode[node];
-
-            if (!group.host && group.vmids.length === 1) {
-                // One container on its own goes to its own endpoint even in
-                // serial mode. Same work either way, but the task is then typed
-                // `ctupdate` with the vmid as its id, so the task list says
-                // "CT 102 - Update Manager" instead of labelling it as a job on
-                // the node - indistinguishable from updating the host itself.
-                requests.push({
-                    url: `/nodes/${node}/lxc/${group.vmids[0]}/updatemgr/run`,
-                    params: {},
-                    node: node,
-                    label: `CT ${group.vmids[0]}`,
-                });
-                return;
-            }
-
-            let params = {};
-            if (group.vmids.length) {
-                params.vmids = group.vmids.join(',');
-            }
-            if (group.host) {
-                params.host = 1;
-            }
-            requests.push({
-                url: `/nodes/${node}/updatemgr/run`,
-                params: params,
-                node: node,
-                label: node,
-            });
-        });
-    }
+    });
 
     if (!requests.length) {
         callback([]);
@@ -341,8 +674,8 @@ PVE.updmgr.dispatch = function (targets, defaultNode, parallel, callback) {
     let started = [];
     // Collected, not alerted one by one: Ext.Msg is a singleton MessageBox, so a
     // dozen simultaneous alert() calls reconfigure and re-show the SAME window
-    // and the user is left with whichever arrived last. With one request per
-    // target that is now the normal case, not a corner.
+    // and the user is left with whichever arrived last. A datacenter selection
+    // spans as many requests as it spans nodes, so that is a real case.
     let failures = [];
     let pending = requests.length;
     let done = function () {
@@ -432,8 +765,54 @@ Ext.define('PVE.updmgr.ScriptPanel', {
                 me.lastUpid = data.last_upid;
                 me.setLoaded(true);
                 me.updateStatus(data);
+                me.setVersionHint(undefined);
             },
         });
+    },
+
+    // Puts an older version into the box and says so. It is NOT restored by
+    // this: restoring is a normal save of that text, so the box can still be
+    // edited first and Revert still throws it away - which is also what keeps
+    // this readable by somebody who may look but not save.
+    loadVersion: function (version, time) {
+        let me = this;
+
+        Proxmox.Utils.API2Request({
+            // Encoded: the identifier is a string in a path now, and while the
+            // two shapes it can have carry nothing that needs escaping, a path
+            // built by concatenation is a path that stops being safe the day the
+            // shape changes.
+            url: `${me.scriptUrl}/versions/${encodeURIComponent(version)}`,
+            method: 'GET',
+            waitMsgTarget: me,
+            failure: function (response) {
+                Ext.Msg.alert(gettext('Error'), response.htmlStatus);
+            },
+            success: function (response) {
+                me.editor.setValue(response.result.data.script);
+                me.setVersionHint(time);
+            },
+        });
+    },
+
+    // Takes the SECOND, not the identifier: the identifier is a local timestamp
+    // string now, and render_timestamp() would read it as an epoch and date the
+    // line to 1970.
+    setVersionHint: function (time) {
+        let me = this;
+
+        if (!me.versionText) {
+            return;
+        }
+
+        me.versionText.setText(
+            time
+                ? Ext.String.format(
+                      gettext('Showing the version of {0} - Save to restore it'),
+                      Proxmox.Utils.render_timestamp(time),
+                  )
+                : '',
+        );
     },
 
     // Save and Update stay disabled until the box holds what the server sent.
@@ -524,6 +903,10 @@ Ext.define('PVE.updmgr.ScriptPanel', {
             success: function () {
                 me.stored = true;
                 me.updateRemoveButton();
+                // What is in the box is what is stored now, so it is no longer
+                // "a version of 10:04" - and the save has just become the
+                // newest entry in the history itself.
+                me.setVersionHint(undefined);
                 if (callback) {
                     callback();
                 }
@@ -564,6 +947,28 @@ Ext.define('PVE.updmgr.ScriptPanel', {
         });
     },
 
+    // Where this target's kept run logs live. Derived from the script endpoint
+    // rather than passed in: they are the same target's endpoints under the same
+    // path, and a second URL to keep in step is a second URL to get wrong.
+    logsUrl: function () {
+        let me = this;
+
+        return me.scriptUrl.replace(/\/script$/, '/logs');
+    },
+
+    openLogs: function () {
+        let me = this;
+
+        Ext.create('PVE.updmgr.LogWindow', {
+            logsUrl: me.logsUrl(),
+            // From the state file, so the task log stays reachable even with
+            // run_logs switched off - which is exactly the case where the window
+            // has no rows to select.
+            lastUpid: me.lastUpid,
+            targetLabel: me.targetLabel || '',
+        }).show();
+    },
+
     updateStatus: function (data) {
         let me = this;
 
@@ -571,9 +976,6 @@ Ext.define('PVE.updmgr.ScriptPanel', {
             me.statusText.setText(
                 `${gettext('Last run')}: ${PVE.updmgr.renderLastRun(data || {})}`,
             );
-        }
-        if (me.logButton) {
-            me.logButton.setDisabled(!me.lastUpid);
         }
     },
 
@@ -604,15 +1006,9 @@ Ext.define('PVE.updmgr.ScriptPanel', {
         });
 
         me.statusText = Ext.create('Ext.toolbar.TextItem', { text: '' });
+        me.versionText = Ext.create('Ext.toolbar.TextItem', { text: '' });
 
-        me.logButton = Ext.create('Ext.Button', {
-            text: gettext('Last Log'),
-            iconCls: 'fa fa-file-text-o',
-            disabled: true,
-            handler: function () {
-                PVE.updmgr.showLog(me.lastUpid);
-            },
-        });
+
 
         let tbar = [];
 
@@ -666,12 +1062,89 @@ Ext.define('PVE.updmgr.ScriptPanel', {
                     me.editor.setValue(script);
                 }),
             );
+
+            // Rebuilt on every open: a save made in this very window has to
+            // show up the next time the menu is dropped down.
+            tbar.push({
+                text: gettext('History'),
+                iconCls: 'fa fa-history',
+                menu: {
+                    items: [{ text: gettext('Loading...'), disabled: true }],
+                    listeners: {
+                        beforeshow: function (menu) {
+                            Proxmox.Utils.API2Request({
+                                url: `${me.scriptUrl}/versions`,
+                                method: 'GET',
+                                failure: function (response) {
+                                    if (menu.destroyed) {
+                                        return;
+                                    }
+                                    menu.removeAll();
+                                    menu.add({
+                                        text: response.htmlStatus,
+                                        disabled: true,
+                                    });
+                                },
+                                success: function (response) {
+                                    if (menu.destroyed) {
+                                        return;
+                                    }
+                                    menu.removeAll();
+                                    menu.add(
+                                        PVE.updmgr.versionMenuItems(
+                                            response.result.data,
+                                            function (version, time) {
+                                                me.loadVersion(version, time);
+                                            },
+                                        ),
+                                    );
+                                },
+                            });
+                        },
+                    },
+                },
+            });
         }
 
-        tbar.push('->', me.statusText, me.logButton);
+        // ONE button, and a plain one. It used to be two - "Last Log" for
+        // Proxmox' task log of the last run, and a "Run Logs" dropdown for the
+        // kept copies - which were two buttons for one question. The window
+        // behind this lists the kept runs, shows what each printed, and carries
+        // the task log as a button of its own; the newest row IS the last run.
+        //
+        // Always enabled, unlike Last Log: a target with kept logs and no current
+        // task still has something to show, and the button inside the window is
+        // the one that goes grey when there is no task.
+        tbar.push(
+            PVE.updmgr.logsButton(function () {
+                me.openLogs();
+            }),
+        );
 
         Ext.apply(me, {
-            tbar: tbar,
+            // Buttons on top, STATE at the bottom - and that split is what fixed
+            // the row rather than any single button.
+            //
+            // "Last run: failed 2026-08-21 14:07:03" and "Showing the version of
+            // ..." are the widest things this window puts anywhere, and they used
+            // to sit on the right of the same row as the buttons. Six buttons and
+            // those two texts did not fit the window, so ExtJS folded the end into
+            // its overflow menu and the buttons somebody actually wanted were
+            // behind a ☰. State is not a button, it belongs under the box it
+            // describes, and moving it there gives the whole width back.
+            //
+            // enableOverflow stays as the net for a narrow screen: with it, what
+            // does not fit is reachable; without it, it is simply cut off. That
+            // is why it was added and it is not a reason to keep crowding the row.
+            tbar: {
+                xtype: 'toolbar',
+                enableOverflow: true,
+                items: tbar,
+            },
+            bbar: {
+                xtype: 'toolbar',
+                items: [me.statusText, '->', me.versionText],
+            },
             items: [me.editor],
         });
 
@@ -710,7 +1183,9 @@ Ext.define('PVE.updmgr.LxcPanel', {
 Ext.define('PVE.updmgr.ScriptWindow', {
     extend: 'Ext.window.Window',
 
-    width: 800,
+    // 800 was chosen when the toolbar had four buttons. It has six now, plus the
+    // last run and its log button, and at 800 the right-hand end was cut off.
+    width: 940,
     height: 520,
     layout: 'fit',
     modal: true,
@@ -796,6 +1271,11 @@ Ext.define('PVE.updmgr.MultiScriptWindow', {
                 // the user has not already seen.
                 me.editor.setValue(unique[0]);
                 me.identical = true;
+                // Kept so save() can ask whether the box still holds it. Without
+                // that, editing a shared script and saving skipped the
+                // confirmation - "they already hold exactly this text" was true
+                // when the window opened and not when Save was pressed.
+                me.sharedScript = unique[0];
                 me.setStatus(
                     Ext.String.format(
                         gettext('All {0} selected targets currently share these commands.'),
@@ -944,7 +1424,7 @@ Ext.define('PVE.updmgr.MultiScriptWindow', {
         // Asked only when something is actually lost. Targets that are empty, or
         // that already hold exactly this text, are not worth a dialog - and a
         // confirmation that appears every time is one nobody reads.
-        if (me.replacing && !me.identical) {
+        if (me.replacing && !(me.identical && script === me.sharedScript)) {
             Ext.Msg.confirm(
                 gettext('Confirm'),
                 Ext.String.format(
@@ -1127,7 +1607,10 @@ Ext.define('PVE.updmgr.TemplateEditWindow', {
 
         Ext.apply(me, {
             title: me.template
-                ? Ext.String.format(gettext('Edit template: {0}'), me.template.name)
+                ? Ext.String.format(
+                      gettext('Edit template: {0}'),
+                      Ext.String.htmlEncode(me.template.name),
+                  )
                 : gettext('New template'),
             items: [me.editor],
             dockedItems: [
@@ -1250,7 +1733,15 @@ Ext.define('PVE.updmgr.TemplateWindow', {
                 data: [],
             }),
             columns: [
-                { header: gettext('Name'), dataIndex: 'name', width: 260 },
+                {
+                    header: gettext('Name'),
+                    dataIndex: 'name',
+                    width: 260,
+                    // A column with no renderer puts the value into the cell as
+                    // markup. The Commands column beside it has always encoded;
+                    // this one is the same free text and needs the same.
+                    renderer: (v) => Ext.String.htmlEncode(v || ''),
+                },
                 {
                     header: gettext('Commands'),
                     dataIndex: 'script',
@@ -1305,7 +1796,7 @@ Ext.define('PVE.updmgr.TemplateWindow', {
                             gettext('Confirm'),
                             Ext.String.format(
                                 gettext('Remove the template "{0}" from the menu?'),
-                                rec.data.name,
+                                Ext.String.htmlEncode(rec.data.name),
                             ),
                             function (btn) {
                                 if (btn === 'yes') {
@@ -1419,6 +1910,242 @@ Ext.define('PVE.updmgr.TargetGrid', {
         });
 
         return answer;
+    },
+
+    // Whether a container on that node is shut down for its snapshot. Read the
+    // same way as parallelFor: the answer is a node setting, and the row that
+    // carries it is that node's own row in the same list.
+    snapshotShutdownFor: function (node) {
+        let me = this;
+
+        let answer = false;
+        me.getStore().each(function (rec) {
+            if (rec.data.type === 'node' && me.nodeOf(rec.data) === node) {
+                answer = !!rec.data.snapshot_shutdown;
+                return false;
+            }
+            return true;
+        });
+
+        return answer;
+    },
+
+    // The position of one target in a run. A prompt rather than an
+    // editable cell: the grid's rows are ticked to select them, and a cell
+    // editor competes with that click for the same pixels.
+    editOrder: function (rec) {
+        let me = this;
+
+        let url = PVE.updmgr.orderUrlFor(rec.data, me.nodename);
+        if (!url) {
+            return;
+        }
+
+        Ext.Msg.prompt(
+            gettext('Update order'),
+            Ext.String.format(
+                gettext(
+                    'Where {0} goes in a run. Lower runs first, and an empty field means'
+                        + ' after everything that has a number. The same number means by'
+                        + ' ascending ID in a serial run, and at the same time in a'
+                        + ' parallel one.',
+                ),
+                PVE.updmgr.targetLabel(rec.data),
+            ),
+            function (btn, text) {
+                if (btn !== 'ok') {
+                    return;
+                }
+
+                let order = PVE.updmgr.parseOrder(text);
+                if (order === undefined) {
+                    Ext.Msg.alert(
+                        gettext('Error'),
+                        Ext.String.format(
+                            gettext('The update order has to be a number between 0 and {0}.'),
+                            PVE.updmgr.MAX_ORDER,
+                        ),
+                    );
+                    return;
+                }
+
+                Proxmox.Utils.API2Request({
+                    url: url,
+                    method: 'PUT',
+                    params: { order: order },
+                    waitMsgTarget: me,
+                    failure: function (response) {
+                        Ext.Msg.alert(gettext('Error'), response.htmlStatus);
+                    },
+                    success: function () {
+                        me.reload();
+                    },
+                });
+            },
+            me,
+            false,
+            rec.data.order ? String(rec.data.order) : '',
+        );
+    },
+
+    // The same thing for a whole selection: ONE number, written to every ticked
+    // target.
+    //
+    // One number and not a sequence, deliberately. "Set the order of these five"
+    // means "these five belong in the same place" far more often than it means
+    // "number them 1 to 5" - a database and its two replicas go together, and a
+    // parallel run then starts them together. Numbering a selection 1..N is the
+    // other job and it needs an order within the selection that a checkbox grid
+    // does not have: ticks have no sequence.
+    orderSelected: function () {
+        let me = this;
+
+        let sel = me.getSelectionModel().getSelection();
+        if (!sel.length) {
+            Ext.Msg.alert(gettext('Error'), gettext('No target selected.'));
+            return;
+        }
+
+        // One target keeps the prompt it always had, which names it and prefills
+        // its own number - the same rule Edit Selected follows.
+        if (sel.length === 1) {
+            me.editOrder(sel[0]);
+            return;
+        }
+
+        // Checked here rather than left to the API: without it the operator types
+        // a number, and the permission error arrives once per target after the
+        // fact - with some of them already written.
+        let refused = sel
+            .filter((rec) =>
+                rec.data.type === 'node' ? !me.canEditHost : !me.canEditGuest,
+            )
+            .map((rec) => PVE.updmgr.targetLabel(rec.data));
+
+        if (refused.length) {
+            Ext.Msg.alert(
+                gettext('Error'),
+                gettext('You may not change the update order of:')
+                    + `<br><br>${refused.join('<br>')}`,
+            );
+            return;
+        }
+
+        // Prefilled with the number they already share, empty when they do not -
+        // so pressing OK on an unchanged box changes nothing, and the field never
+        // suggests a value that only some of them have.
+        let orders = sel.map((rec) => rec.data.order || 0);
+        let shared = orders.every((o) => o === orders[0]) && orders[0] ? String(orders[0]) : '';
+
+        Ext.Msg.prompt(
+            gettext('Update order'),
+            Ext.String.format(
+                gettext(
+                    'Where these {0} targets go in a run. They all get the SAME number:'
+                        + ' in a parallel run that means they start together and the next'
+                        + ' number waits for all of them, in a serial one they go one after'
+                        + ' another by ascending ID. Lower runs first, and an empty field'
+                        + ' means after everything that has a number.',
+                ),
+                sel.length,
+            ),
+            function (btn, text) {
+                if (btn !== 'ok') {
+                    return;
+                }
+
+                let order = PVE.updmgr.parseOrder(text);
+                if (order === undefined) {
+                    Ext.Msg.alert(
+                        gettext('Error'),
+                        Ext.String.format(
+                            gettext('The update order has to be a number between 0 and {0}.'),
+                            PVE.updmgr.MAX_ORDER,
+                        ),
+                    );
+                    return;
+                }
+
+                let failures = [];
+                let pending = sel.length;
+
+                me.setLoading(true);
+
+                let finish = function () {
+                    pending--;
+                    if (pending > 0) {
+                        return;
+                    }
+
+                    me.setLoading(false);
+                    // Whatever went wrong, the rows that DID change have to be
+                    // shown as they are now - a grid still showing the old
+                    // numbers after a partial write is the one state nobody can
+                    // act on.
+                    me.reload();
+
+                    if (failures.length) {
+                        // One dialog, not one per target: Ext.Msg is a singleton,
+                        // so a dozen alerts leave only the last one standing.
+                        Ext.Msg.alert(
+                            gettext('Error'),
+                            Ext.String.format(
+                                gettext('{0} of {1} targets could not be changed:'),
+                                failures.length,
+                                sel.length,
+                            ) + `<br><br>${failures.join('<br>')}`,
+                        );
+                    }
+                };
+
+                sel.forEach(function (rec) {
+                    let url = PVE.updmgr.orderUrlFor(rec.data, me.nodename);
+                    if (!url) {
+                        failures.push(
+                            `${PVE.updmgr.targetLabel(rec.data)}: ${gettext('unknown node')}`,
+                        );
+                        finish();
+                        return;
+                    }
+
+                    Proxmox.Utils.API2Request({
+                        url: url,
+                        method: 'PUT',
+                        params: { order: order },
+                        failure: function (response) {
+                            failures.push(
+                                `${PVE.updmgr.targetLabel(rec.data)}: ${response.htmlStatus}`,
+                            );
+                            finish();
+                        },
+                        success: finish,
+                    });
+                });
+            },
+            me,
+            false,
+            shared,
+        );
+    },
+
+    // One entry point to a target's logs, from the row as from the editor: the
+    // window with all of them. There is no "show me exactly one log" anywhere any
+    // more - picking which one is what the window is for.
+    openLogs: function (rec) {
+        let me = this;
+
+        let url = PVE.updmgr.logsUrlFor(rec.data, me.nodename);
+        if (!url) {
+            return;
+        }
+
+        Ext.create('PVE.updmgr.LogWindow', {
+            logsUrl: url,
+            // From the row's own state, so Proxmox' task log of the last run is
+            // reachable even for a target whose logs are switched off.
+            lastUpid: rec.data.last_upid,
+            targetLabel: PVE.updmgr.targetLabel(rec.data),
+        }).show();
     },
 
     editTarget: function (rec) {
@@ -1538,7 +2265,7 @@ Ext.define('PVE.updmgr.TargetGrid', {
     runRow: function (rec) {
         let me = this;
 
-        PVE.updmgr.dispatch([rec.data], me.nodename, true, function (started) {  // one target: identical either way
+        PVE.updmgr.dispatch([rec.data], me.nodename, function (started) {
             me.reload();
             if (started.length === 1) {
                 let win = Ext.create('Proxmox.window.TaskViewer', { upid: started[0].upid });
@@ -1585,11 +2312,16 @@ Ext.define('PVE.updmgr.TargetGrid', {
         });
         if (selection.length > 1) {
             if (modes.parallel && !modes.serial) {
-                lines.push(gettext('They all start at once, each in its own task.'));
+                lines.push(
+                    gettext(
+                        'Targets sharing an update-order position start at once; the next'
+                            + ' position waits for all of them.',
+                    ),
+                );
             } else if (modes.serial && !modes.parallel) {
                 lines.push(gettext('They run one after another, per server.'));
             } else {
-                lines.push(gettext('Some servers start them at once, others one after another.'));
+                lines.push(gettext('Some servers start them by position, others one at a time.'));
             }
         }
         if (nodeCount > 1) {
@@ -1611,53 +2343,52 @@ Ext.define('PVE.updmgr.TargetGrid', {
             );
         }
 
+        // Downtime nobody asked for at the moment of clicking, so it is said
+        // here rather than discovered in the log: with this on, a running
+        // container is shut down for its snapshot and started again.
+        let cold = selection.filter(
+            (rec) => rec.data.type === 'lxc' && me.snapshotShutdownFor(me.nodeOf(rec.data)),
+        ).length;
+        if (cold) {
+            lines.push(
+                Ext.String.format(
+                    gettext(
+                        '{0} of them are shut down for their snapshot and started again'
+                            + ' afterwards - they are unavailable while that happens.',
+                    ),
+                    cold,
+                ),
+            );
+        }
+
         Ext.Msg.confirm(PVE.updmgr.TAB_TITLE, lines.join('<br>'), function (btn) {
             if (btn !== 'yes') {
                 return;
             }
 
-            // Per node, because the setting is per node: a datacenter selection
-            // can legitimately be parallel on one server and serial on another.
-            let byMode = { parallel: [], serial: [] };
-            selection.forEach(function (rec) {
-                let key = me.parallelFor(me.nodeOf(rec.data)) ? 'parallel' : 'serial';
-                byMode[key].push(rec.data);
-            });
-
-            let collected = [];
-            let waiting = 0;
-            let finish = function (started) {
-                collected = collected.concat(started);
-                waiting--;
-                if (waiting > 0) {
-                    return;
-                }
-                me.reload();
-                if (collected.length === 1) {
-                    let win = Ext.create('Proxmox.window.TaskViewer', {
-                        upid: collected[0].upid,
-                    });
-                    win.on('destroy', function () {
-                        me.reload();
-                    });
-                    win.show();
-                }
-                // With several tasks in flight there is no single one to show -
-                // the rows themselves are the progress display.
-            };
-
-            ['parallel', 'serial'].forEach(function (mode) {
-                if (byMode[mode].length) {
-                    waiting++;
-                }
-            });
-
-            ['parallel', 'serial'].forEach(function (mode) {
-                if (!byMode[mode].length) {
-                    return;
-                }
-                PVE.updmgr.dispatch(byMode[mode], me.nodename, mode === 'parallel', finish);
-            });
+            // One call, whichever way each node updates: the selection is
+            // split by node inside dispatch, and how a node walks its own share
+            // is that node's setting - answered on the node. It used to be split
+            // here, into a parallel half and a serial half, because the two
+            // halves were sent differently.
+            PVE.updmgr.dispatch(
+                selection.map((rec) => rec.data),
+                me.nodename,
+                function (started) {
+                    me.reload();
+                    if (started.length === 1) {
+                        let win = Ext.create('Proxmox.window.TaskViewer', {
+                            upid: started[0].upid,
+                        });
+                        win.on('destroy', function () {
+                            me.reload();
+                        });
+                        win.show();
+                    }
+                    // With several tasks in flight there is no single one to
+                    // show - the rows themselves are the progress display.
+                },
+            );
         });
     },
 
@@ -1785,6 +2516,12 @@ Ext.define('PVE.updmgr.TargetGrid', {
                     return `<i class="fa fa-fw fa-cube"></i> ${rec.data.template ? gettext('Template') : 'CT'}`;
                 },
             },
+            // No renderer on these three, and that is not an oversight: an id is
+            // a vmid or a node name, and a container's name is its hostname,
+            // which PVE stores under `format => 'dns-name'` - letters, digits,
+            // dashes and dots, read off its own JSONSchema. There is no markup
+            // to escape. A template NAME is the opposite case - free text - and
+            // is encoded everywhere it is shown.
             {
                 header: gettext('ID'),
                 dataIndex: 'id',
@@ -1827,6 +2564,16 @@ Ext.define('PVE.updmgr.TargetGrid', {
                 },
             },
             {
+                header: gettext('Order'),
+                dataIndex: 'order',
+                width: 80,
+                renderer: function (value) {
+                    return value
+                        ? value
+                        : `<span class="faded">${gettext('last')}</span>`;
+                },
+            },
+            {
                 header: gettext('Last Run'),
                 dataIndex: 'last_state',
                 width: 220,
@@ -1837,7 +2584,7 @@ Ext.define('PVE.updmgr.TargetGrid', {
             {
                 xtype: 'actioncolumn',
                 header: gettext('Actions'),
-                width: 120,
+                width: 150,
                 align: 'center',
                 items: [
                     {
@@ -1852,12 +2599,14 @@ Ext.define('PVE.updmgr.TargetGrid', {
                     },
                     {
                         iconCls: 'fa fa-file-text-o',
-                        tooltip: gettext('Last log'),
-                        isActionDisabled: function (view, rI, cI, item, rec) {
-                            return !rec.data.last_upid;
-                        },
+                        tooltip: gettext('Logs'),
+                        // Never disabled. It used to open Proxmox' task log of
+                        // the last run and was grey without one; now it opens the
+                        // window with ALL of this target's logs, and a target
+                        // with kept logs and no current task still has something
+                        // to show. The task log is a button inside it.
                         handler: function (view, rI, cI, item, e, rec) {
-                            PVE.updmgr.showLog(rec.data.last_upid);
+                            me.openLogs(rec);
                         },
                     },
                     {
@@ -1865,6 +2614,16 @@ Ext.define('PVE.updmgr.TargetGrid', {
                         tooltip: gettext('Edit commands'),
                         handler: function (view, rI, cI, item, e, rec) {
                             me.editTarget(rec);
+                        },
+                    },
+                    {
+                        iconCls: 'fa fa-sort-numeric-asc',
+                        tooltip: gettext('Update order'),
+                        isActionDisabled: function (view, rI, cI, item, rec) {
+                            return rec.data.type === 'node' ? !me.canEditHost : !me.canEditGuest;
+                        },
+                        handler: function (view, rI, cI, item, e, rec) {
+                            me.editOrder(rec);
                         },
                     },
                     {
@@ -1916,7 +2675,9 @@ Ext.define('PVE.updmgr.TargetGrid', {
                 { name: 'last_exit', type: 'int' },
                 { name: 'stored', type: 'boolean' },
                 { name: 'template', type: 'boolean' },
+                { name: 'order', type: 'int' },
                 { name: 'parallel_manual', type: 'boolean' },
+                { name: 'snapshot_shutdown', type: 'boolean' },
             ],
             proxy: {
                 type: 'proxmox',
@@ -1974,6 +2735,17 @@ Ext.define('PVE.updmgr.TargetGrid', {
                     disabled: !me.canEditGuest && !me.canEditHost,
                     handler: function () {
                         me.editSelected();
+                    },
+                },
+                {
+                    // Beside Edit Selected because it is the same kind of act on
+                    // the same thing: what the row's own Update order button does
+                    // for one target, for every ticked one at once.
+                    text: gettext('Order Selected'),
+                    iconCls: 'fa fa-sort-numeric-asc',
+                    disabled: !me.canEditGuest && !me.canEditHost,
+                    handler: function () {
+                        me.orderSelected();
                     },
                 },
                 // Node and datacenter tabs, not the container tab - see
@@ -2077,6 +2849,15 @@ Ext.define('PVE.updmgr.SettingsWindow', {
                 me.down('#startStopped').setValue(!!data.start_stopped);
                 me.down('#snapshotBefore').setValue(!!data.snapshot_before);
                 me.down('#snapshotKeep').setValue(data.snapshot_keep || 3);
+                me.down('#snapshotShutdown').setValue(!!data.snapshot_shutdown);
+                me.down('#rollbackOnFailure').setValue(!!data.rollback_on_failure);
+                me.down('#notifyFailure').setValue(!!data.notify_failure);
+                me.down('#scriptVersions').setValue(data.script_versions || 3);
+                // Not `|| 3`: 0 is a real answer here - keep no run logs - and a
+                // falsy-or-default would quietly turn it back on.
+                me.down('#runLogs').setValue(
+                    data.run_logs === undefined ? 3 : data.run_logs,
+                );
                 // Hidden, not disabled, and decided by the server: a switch
                 // that is visible but can do nothing is a question the operator
                 // has to answer and then find out did not matter. What the
@@ -2162,6 +2943,11 @@ Ext.define('PVE.updmgr.SettingsWindow', {
             start_stopped: me.down('#startStopped').getValue() ? 1 : 0,
             snapshot_before: me.down('#snapshotBefore').getValue() ? 1 : 0,
             snapshot_keep: me.down('#snapshotKeep').getValue(),
+            snapshot_shutdown: me.down('#snapshotShutdown').getValue() ? 1 : 0,
+            rollback_on_failure: me.down('#rollbackOnFailure').getValue() ? 1 : 0,
+            notify_failure: me.down('#notifyFailure').getValue() ? 1 : 0,
+            script_versions: me.down('#scriptVersions').getValue(),
+            run_logs: me.down('#runLogs').getValue(),
             schedule_enabled: me.down('#scheduleEnabled').getValue() ? 1 : 0,
             schedule_time: me.down('#scheduleTime').getValue(),
             schedule_parallel: me.down('#scheduleParallel').getValue() ? 1 : 0,
@@ -2435,6 +3221,133 @@ Ext.define('PVE.updmgr.SettingsWindow', {
                                             + ' without one, and the run says so in its log.',
                                     ),
                                 },
+                                {
+                                    xtype: 'checkbox',
+                                    itemId: 'rollbackOnFailure',
+                                    margin: '8 0 0 0',
+                                    boxLabel: gettext(
+                                        'Roll the container back to that snapshot when the update fails',
+                                    ),
+                                },
+                                {
+                                    xtype: 'displayfield',
+                                    userCls: 'faded',
+                                    value: gettext(
+                                        'Off by default, and not a small switch: a rollback throws'
+                                            + ' away everything that happened since the snapshot, not'
+                                            + ' only what the update did - anything a service wrote in'
+                                            + ' the meantime goes with it. The container is stopped for'
+                                            + ' the rollback and started again if it was running.',
+                                    ),
+                                },
+                                {
+                                    xtype: 'checkbox',
+                                    itemId: 'snapshotShutdown',
+                                    margin: '8 0 0 0',
+                                    boxLabel: gettext(
+                                        'Shut the container down for the snapshot, then start it again',
+                                    ),
+                                },
+                                {
+                                    xtype: 'displayfield',
+                                    userCls: 'faded',
+                                    value: gettext(
+                                        'Off by default. A container snapshot never holds memory -'
+                                            + ' that exists for VMs only - so a running container is'
+                                            + ' caught as if the power had been pulled, and a database'
+                                            + ' mid-transaction is caught mid-transaction. Stopping it'
+                                            + ' first is the only way to a consistent snapshot, and it'
+                                            + ' costs the downtime of a shutdown and a start. A'
+                                            + ' container that was already stopped is untouched.',
+                                    ),
+                                },
+                            ],
+                        },
+                        {
+                            xtype: 'fieldset',
+                            title: gettext('Notifications'),
+                            margin: '0 0 10 0',
+                            items: [
+                                {
+                                    xtype: 'checkbox',
+                                    itemId: 'notifyFailure',
+                                    boxLabel: gettext(
+                                        'Send a notification when a run had a target fail',
+                                    ),
+                                },
+                                {
+                                    xtype: 'displayfield',
+                                    userCls: 'faded',
+                                    // No address field here on purpose: this
+                                    // goes out through Proxmox' own notification
+                                    // system, so where it lands is already
+                                    // configured once, for every job on the
+                                    // node, under Datacenter -> Notifications.
+                                    value: gettext(
+                                        'On by default. One notification per run, once the whole'
+                                            + ' run is over, listing the targets that failed with'
+                                            + ' their exit code and the time they finished. It goes'
+                                            + ' wherever this node already sends its backup and'
+                                            + ' package notifications - Datacenter → Notifications'
+                                            + ' decides that. Nothing is sent for a run in which'
+                                            + ' everything worked, and a target that was skipped is'
+                                            + ' not a failure.',
+                                    ),
+                                },
+                            ],
+                        },
+                        {
+                            xtype: 'fieldset',
+                            title: gettext('Update commands'),
+                            margin: '0 0 10 0',
+                            items: [
+                                {
+                                    xtype: 'proxmoxintegerfield',
+                                    itemId: 'scriptVersions',
+                                    fieldLabel: gettext('Keep the last'),
+                                    labelWidth: 160,
+                                    minValue: 1,
+                                    maxValue: 50,
+                                    allowBlank: false,
+                                    emptyText: '3',
+                                },
+                                {
+                                    xtype: 'displayfield',
+                                    userCls: 'faded',
+                                    value: gettext(
+                                        'Saved versions of each target\'s commands, reachable from'
+                                            + ' the History button in the editor. Every save that'
+                                            + ' changes something writes one, and the newest is what'
+                                            + ' is stored now - so 3 means the current text and the'
+                                            + ' two before it.',
+                                    ),
+                                },
+                                {
+                                    xtype: 'proxmoxintegerfield',
+                                    itemId: 'runLogs',
+                                    fieldLabel: gettext('Keep run logs'),
+                                    labelWidth: 160,
+                                    margin: '8 0 0 0',
+                                    minValue: 0,
+                                    maxValue: 50,
+                                    allowBlank: false,
+                                    emptyText: '3',
+                                },
+                                {
+                                    xtype: 'displayfield',
+                                    userCls: 'faded',
+                                    value: gettext(
+                                        'Logs of past runs, per target, reachable from the Run'
+                                            + ' Logs button in the editor. 0 keeps none. They are'
+                                            + ' kept on the node that ran them rather than in'
+                                            + ' /etc/pve, where a file may not exceed 1 MiB - one'
+                                            + ' target may write up to 8 MiB to a log. Proxmox has'
+                                            + ' its own task log, but its entry falls out of the'
+                                            + ' task index after a few thousand tasks and the Last'
+                                            + ' Log button then finds nothing; this copy is pruned'
+                                            + ' on purpose instead.',
+                                    ),
+                                },
                             ],
                         },
                         {
@@ -2455,6 +3368,16 @@ Ext.define('PVE.updmgr.SettingsWindow', {
                                     // row can be ticked too, and the label would
                                     // then be describing something it does not do.
                                     boxLabel: gettext('Update all targets in parallel'),
+                                },
+                                {
+                                    xtype: 'displayfield',
+                                    userCls: 'faded',
+                                    value: gettext(
+                                        'The update order still applies: targets sharing a'
+                                            + ' position start at once, and the next position'
+                                            + ' does not start until the last of them is done.'
+                                            + ' Targets with no position set are one final group.',
+                                    ),
                                 },
                             ],
                         },
@@ -2487,6 +3410,16 @@ Ext.define('PVE.updmgr.SettingsWindow', {
                                     itemId: 'scheduleParallel',
                                     margin: '0 0 8 0',
                                     boxLabel: gettext('Update all targets in parallel'),
+                                },
+                                {
+                                    xtype: 'displayfield',
+                                    userCls: 'faded',
+                                    margin: '0 0 8 0',
+                                    value: gettext(
+                                        'By position, exactly as a manual parallel run - and in'
+                                            + ' one task, so the notification at the end speaks'
+                                            + ' for the whole run.',
+                                    ),
                                 },
                                 // Which containers a schedule runs is the one
                                 // answer that cannot be given for the whole
@@ -2683,10 +3616,11 @@ PVE.updmgr.injectTab = function (panel) {
 
 // ── Throwing the stored commands away with the container ────────────────────
 //
-// A destroyed container leaves lxc-<vmid>.conf and lxc-<vmid>.state behind in
-// /etc/pve. That is not only clutter: Proxmox hands vmids out again, so the next
-// container created as 101 would inherit the update commands of the one that was
-// deleted - and its last-run record - without anybody having typed them.
+// A destroyed container leaves everything it had in /etc/pve behind: its
+// commands, the saved versions of them, its place in a run and its
+// last-run record. That is not only clutter - Proxmox hands vmids out again, so
+// the next container created as 101 would inherit all of it without anybody
+// having typed a line.
 //
 // So the destroy dialog gets one more tick, on by default, and it is a tick
 // rather than an automatism because the files are also a legitimate thing to
@@ -2710,8 +3644,9 @@ PVE.updmgr.destroyCleanupUrl = function (url) {
         return undefined;
     }
 
-    // purge: the last-run record goes too. Keeping it would hand a container's
-    // update history to whatever is created with that vmid next.
+    // purge: the last-run record, the saved versions and the order go too.
+    // Keeping any of them would hand a container's update history to whatever is
+    // created with that vmid next.
     return `/nodes/${match[1]}/lxc/${match[2]}/updatemgr/script?purge=1`;
 };
 
@@ -2742,10 +3677,10 @@ Ext.define('PVE.updmgr.SafeDestroyGuestOverride', {
                         autoEl: {
                             tag: 'div',
                             'data-qtip': gettext(
-                                'Removes this container from the Update Manager: its commands'
-                                    + ' and its last-run record. Without this they stay, and a'
-                                    + ' new container created with the same ID would inherit'
-                                    + ' them.',
+                                'Removes this container from the Update Manager: its commands,'
+                                    + ' their saved versions, its place in a run and its'
+                                    + ' last-run record. Without this they stay, and a new'
+                                    + ' container created with the same ID would inherit them.',
                             ),
                         },
                     },

@@ -15,14 +15,20 @@ Description: Update Manager tab for Proxmox VE containers and nodes
  container by pressing Update. Nothing is generated.
  .
  The node and datacenter tabs list the hosts and every container. Tick the ones
- that should be updated and they all start at once, each in its own Proxmox
- task, with its own log and its own recorded state - which the row then shows.
- The datacenter tab spans the whole cluster, so several servers update at the
- same time.
+ that should be updated and they run one after another, each leaving its own
+ recorded state and its own task log - which the row then shows. A setting
+ starts them all at once instead. The datacenter tab spans the whole cluster,
+ and there the servers always work in parallel with each other.
  .
- A node can also run its updates on a timer: the Schedule window sets the
- interval, which targets are included, and whether they run at the same time or
- one after another (one after another by default).
+ Before a container is updated it is snapshotted, where its storage can take
+ one, so a bad upgrade can be rolled back; the oldest above a retention count
+ are removed after the run. Every save of a target's commands is kept as well,
+ and can be put back from the editor.
+ .
+ A node can also run its updates on a timer: the Settings window sets when (a
+ systemd calendar event such as 03:00 or mon..fri 02:30), which targets are
+ included, and whether they run at the same time or one after another (one
+ after another by default).
  .
  The integration is four one-line edits to files owned by pve-manager (a script
  tag in index.html.tpl and a require in pvedaemon, pveproxy and pvesh). They are

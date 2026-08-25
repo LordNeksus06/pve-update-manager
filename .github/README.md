@@ -23,7 +23,18 @@ normal Proxmox task and records how each target's last run ended.
 - **Templates menu** — cluster-wide starting points to paste in, editable and
   resettable.
 - **Snapshot before an update**, where the storage can take one, with a
-  retention count. On by default.
+  retention count. On by default, optionally with the container shut down for it,
+  and optionally rolled back to when the update fails.
+- **Script history** — every save is kept with its time and its author, and can
+  be put back from the editor. Retention count, default 3.
+- **Run logs** — every run keeps its own log per target, readable from the
+  editor. Retention count, default 3, `0` keeps none.
+- **Update order** — a number per target; lowest first, in serial and parallel
+  runs alike. In parallel, everything sharing a number starts at once and the
+  next number waits for all of it. *Order Selected* writes one number to a whole
+  selection.
+- **Failure notifications** — one at the end of a run that had a target fail,
+  through Proxmox' own notification system. On by default.
 - **Scheduled runs** — a systemd calendar event per node, serial or parallel.
 - **Datacenter-wide settings** — write one settings page to every node.
 - **Start stopped containers** for their update and stop them again afterwards.
@@ -31,6 +42,9 @@ normal Proxmox task and records how each target's last run ended.
   may write to the task log.
 - **Nothing gets switched off mid-update** — the container carries a `mounted`
   config lock and the node holds a systemd shutdown inhibitor for the whole job.
+- **A daemon restart does not kill the run** — the worker moves itself into a
+  systemd scope of its own before it starts, so a package whose postinst restarts
+  `pvedaemon` no longer interrupts a dist-upgrade halfway through.
 - **Destroy cleanup** — Proxmox' destroy dialog offers to delete the stored
   commands with the container, ticked by default.
 
@@ -63,12 +77,17 @@ the node they run on.
 | --- | --- | --- |
 | `snapshot_before` | on | snapshot a container before updating it |
 | `snapshot_keep` | 3 | how many of *our* snapshots to keep per container (1–100) |
-| `parallel_manual` | off | start all targets at once on *Update Selected* |
+| `snapshot_shutdown` | off | shut a running container down for its snapshot, start it again after |
+| `rollback_on_failure` | off | roll the container back to that snapshot when the update fails |
+| `notify_failure` | on | notify when a run had a target fail |
+| `script_versions` | 3 | saved versions of each target's commands to keep (1–50) |
+| `run_logs` | 3 | logs of past runs to keep per target (0–50, 0 keeps none) |
+| `parallel_manual` | off | *Update Selected* runs a whole update-order position at once |
 | `timeout` | 14400 | seconds before a target's update is killed (10–86400) |
 | `start_stopped` | off | start a stopped container for its update, stop it after |
 | `schedule_enabled` | off | run the selected targets on a schedule |
 | `schedule_time` | `03:00` | systemd calendar event |
-| `schedule_parallel` | off | start all targets at once on a scheduled run |
+| `schedule_parallel` | off | the same for a scheduled run |
 | `schedule_host` | off | include the node's own script in scheduled runs |
 | `schedule_vmids` | — | which containers the schedule runs |
 
@@ -83,6 +102,8 @@ is written.
 | storage can snapshot | `updmgr-<date>-<time>` before the run; ours above the retention count are removed after it |
 | storage cannot | updated anyway, the log says so |
 | snapshot fails | the target fails before the update starts |
+| `snapshot_shutdown` on | shut down, snapshotted, started again, then updated |
+| `rollback_on_failure` on, update failed | rolled back to that snapshot, and started again if it was running |
 
 Good to know:
 
@@ -96,6 +117,225 @@ Good to know:
   forced out of the config, with a warning that its volume may still be on the
   storage. Only a lock whose value is exactly `snapshot-delete` is ever removed,
   and the row says how many snapshots are still stuck.
+- A container that is *already* locked that way when a run starts is repaired
+  too, but only once its config has been untouched for ten minutes — a removal
+  that is really running writes that file as it goes. A `backup`, `mounted` or
+  `migrate` lock is never touched and the target is skipped as before.
+- The usual way to get there is a snapshot that is in the container's config but
+  no longer on the storage, which a manual rollback or `zfs destroy` outside PVE
+  can leave behind.
+- `rollback_on_failure` undoes a failed update, and it is off by default because
+  it undoes **everything** since the snapshot, not only what the update did -
+  anything a service wrote in the meantime goes with it. Only a snapshot this
+  addon took in that same run is ever rolled back to, never one somebody made by
+  hand. PVE stops the container to roll it back and leaves it stopped, so one
+  that was running is started again afterwards; one that was only started for
+  its update stays stopped. The row says *rolled back to …* instead of naming a
+  snapshot to go back to, because the container is no longer the one the update
+  left behind. A rollback that fails says so on the row.
+- A worker that is killed - node reboot, out-of-memory - never gives the
+  `mounted` lock back, and every later run then skips that container with
+  *another task holds the lock*. Where nothing has touched the container for ten
+  minutes the row says so and names `pct unlock <vmid>`. The lock is not removed
+  automatically: `pct mount` sets the same value, and a container whose rootfs
+  is mounted on the host is the last one to write into from a second direction.
+- An LXC snapshot never holds memory — that exists for VMs only. With
+  `snapshot_shutdown` a running container is stopped first, snapshotted, started
+  again and then updated; it ends up running, as it was found. A container that
+  was already stopped is not touched by it, and a storage that cannot snapshot
+  costs no downtime. If the shutdown or the restart fails, the target fails and
+  the update does not run.
+- A shutdown that does not finish in 120 s falls back to a hard stop, and the
+  log says so — the snapshot is then crash-consistent rather than clean.
+- A worker that is killed while the container is down (node reboot, OOM) leaves
+  it down. That is the same exposure a `stop`-mode backup has.
+
+## Script history
+
+Every save that changes something is kept beside the script, named after the
+local second it was saved at and the user who saved it — readable without
+decoding anything:
+
+```
+lxc-10065@2026-08-21-13-21-12-root@pam.conf
+```
+
+The **History** button in the editor lists them; picking one puts that text into
+the box, and Save stores it.
+
+| | |
+| --- | --- |
+| how many are kept | `script_versions`, default 3, range 1–50 |
+| the newest entry | the text that is stored now |
+| a save that changes nothing | writes nothing |
+| restoring | a normal save, and becomes the newest version itself |
+| removing the commands | keeps the history |
+| `--purge 1`, the destroy tick | deletes it |
+
+```sh
+pvesh get /nodes/pve/lxc/101/updatemgr/script/versions
+pvesh get /nodes/pve/lxc/101/updatemgr/script/versions/2026-08-21-13-21-12
+```
+
+Versions saved before that naming existed are named `*.conf.<epoch>[.<user>]` and
+are still listed, still readable and still pruned — they age out through the
+retention count on their own. Their identifier is that epoch, which is what the
+listing hands back for them.
+
+Good to know: a file edited directly in `/etc/pve` writes no version — what is
+recorded is a save that went through the API. And the time in the name is local,
+so in the one hour a DST change repeats, a save takes the next free second rather
+than overwriting the file already there.
+
+## Run logs
+
+Every run keeps its own log **per target** — one file per target per run, with
+the retention count `run_logs`. The **Logs** button — in the editor, and the log
+icon on every row — opens them all in one window: the runs on top, what the
+selected one printed below, and Proxmox' own task log for it as a button of its
+own. There is no view of a single log anywhere; picking which one is what the
+window is for.
+
+```
+=== pve-update-manager ===
+target:   CT 101 (nextcloud)
+started:  2026-08-21 13:21:12
+finished: 2026-08-21 13:22:05
+result:   FAILED (exit 100 after 53s, rolled back to updmgr-20260821-132112)
+task:     UPID:pve:00001234:00005678:00000000:ctupdate:101:root@pam:
+
+Reading package lists...
+E: Unable to correct problems
+```
+
+| | |
+| --- | --- |
+| where | `/var/lib/pve-update-manager/logs/<target>@<date>-<time>.log` |
+| how many | `run_logs`, default 3, `0` keeps none |
+| what is in one | the target's own output, plus what the run did around it — the snapshot it took, a container it started, a rollback |
+| a skipped target | gets one too, saying why |
+| `--purge 1`, the destroy tick | deletes them |
+
+Not in `/etc/pve`, and not a preference: pmxcfs refuses a file over **1 MiB**
+(measured: 1024 KiB written, 1025 KiB refused) while one target may write up to
+8 MiB, and that filesystem is held in memory on every node and replicated to all
+of them. A run happens on the node that owns the target, so its log stays there.
+
+**In a cluster** that means a run log is *not* replicated — but it is still
+readable from any node's web interface, because every endpoint here is
+`proxyto => 'node'` and the interface addresses the node that owns the target,
+not the one the browser is connected to. What is node-local is the *shell* view:
+`ls /var/lib/pve-update-manager/logs` on node 1 does not show node 2's logs.
+
+Why keep one when Proxmox already writes a task log: the task log stays on disk
+but stops being **reachable**. `/var/log/pve/tasks/index` is renamed to `index.1`
+once it passes 50000 bytes — about a thousand tasks — so after a couple of
+thousand tasks the entry that points at a log is gone from the task list, and the
+*Proxmox Task Log* button in the window finds nothing. There is no logrotate rule
+for the files
+either, so they simply accumulate. This copy is pruned on purpose instead.
+
+```sh
+pvesh get /nodes/pve/lxc/101/updatemgr/logs
+pvesh get /nodes/pve/lxc/101/updatemgr/logs/2026-08-21-13-21-12
+```
+
+## Update order
+
+A number per target, shown as its own column and set from the row's **Update
+order** button. It decides the order of every run, manual and scheduled, serial
+and parallel.
+
+| Value | Meaning |
+| --- | --- |
+| 1…99999 | lower runs first |
+| the same number twice | serial: by ascending vmid, host before container. parallel: both at once |
+| empty, or 0 | after everything that has a number |
+
+**Order Selected** in the toolbar writes one number to every ticked target at
+once — which is how a group that belongs together gets a position of its own. A
+single ticked target opens the row's own prompt instead, prefilled with its
+number; the box is prefilled for a selection too, but only with a number they
+already share. An empty box clears it.
+
+```sh
+pvesh set /nodes/pve/lxc/101/updatemgr/order --order 10
+pvesh set /nodes/pve/lxc/101/updatemgr/order --order 0    # clear it
+pvesh set /nodes/pve/updatemgr/order --order 1            # the host itself
+```
+
+In a **parallel** run the number is a position: everything sharing one starts at
+once, and the next position does not start until the last target of the previous
+one is done. Targets with no number are one final position, all at once — so a
+parallel run nobody has given an order to is still fully parallel.
+
+```
+position 1 of 3: CT 101 (db)
+position 2 of 3: CT 102 (web), CT 103 (web2)     <- both at once
+position 3 of 3: CT 110, CT 111, CT 112          <- no number, so last
+```
+
+The whole run is one task either way, and in a parallel one every line of output
+carries the target that printed it: `[CT 102] Reading package lists...`.
+
+## Notifications
+
+A run that had a target fail sends one notification when the **whole run** is
+over — not one per target. It goes through Proxmox' own notification system, so
+where it lands is already configured under **Datacenter → Notifications** and
+there is no address to enter here. `notify_failure` turns it off.
+
+| | |
+| --- | --- |
+| severity | `error` |
+| metadata | `type=pve-update-manager`, `hostname=<node>` |
+| template | `/usr/share/pve-manager/templates/default/pve-update-manager-*.hbs` |
+
+Nothing is sent for a run in which everything worked, and a target that was
+*skipped* is not a failure.
+
+One block per failed target, everything on a line of its own:
+
+```
+Subject: update manager status (pve.example.com): 1 of 2 update targets failed
+
+1 of 2 update targets failed
+
+Result
+======
+Succeeded:    1 of 2 targets
+Failed:       1 of 2
+Skipped:      0 of 2
+Running time: 84s
+
+Details
+=======
+CT 102 (web)
+  Failed at:   2026-08-20 03:04:11
+  Took:        71s
+  Exit code:   100 (the script exited)
+  Snapshot:    updmgr-20260820-030300
+  Rolled back: no - the snapshot above is still there to go back to
+  Also:        nothing else to report
+
+Task
+====
+UPID:pve:00001234:00005678:00000000:updatemgr:pve:root@pam:
+```
+
+`Rolled back` answers three different questions at once — whether the update was
+taken back, whether the container came back up, and whether there is still a
+snapshot to go back to — because those decide what to do next. `Exit code` says
+whether the script exited or the timeout killed it: both are a number, and 124
+means two different things. `Also` carries what nothing else does: dropped output,
+a container that could not be stopped again, a snapshot that could not be removed.
+
+A matcher can route these on their own:
+
+```sh
+pvesh create /cluster/notifications/matchers --name updates \
+    --match-field 'exact:type=pve-update-manager' --target <your-target>
+```
 
 ## Scheduled runs
 
@@ -167,6 +407,29 @@ The first line may be a shebang and picks the interpreter; the default is
 re-parsed by another shell. On the node it runs directly, in a container through
 `pct exec` — a stopped container is skipped unless `start_stopped` is on.
 
+## Umlauts, emoji and colour
+
+Scripts are stored as UTF-8 and reach the container as UTF-8. Two things had to
+be arranged for that, and one is still not perfect:
+
+| | |
+| --- | --- |
+| storage | the file is UTF-8 and the API is handed characters, so nothing is encoded twice or written as Latin-1 |
+| into the container | the script travels base64-encoded, because `pct exec` replaces every non-ASCII **byte** of an argument with `U+FFFD` |
+| terminal colour | escape sequences are removed from the log |
+
+Good to know:
+
+- The base64 needs `base64` in the container. coreutils and busybox both have
+  it; where it is missing the script is used as it arrived and the log says so.
+- Colour cannot be shown: Proxmox' log viewer html-encodes every line, so an
+  escape sequence would appear as `[0;31m`. Stripping them is the only thing
+  available without changing Proxmox' own JavaScript.
+- **The task viewer still shows non-ASCII wrong** — `Ã¼` for `ü`. The log file
+  on disk is correct UTF-8; PVE's own task-log endpoint reads it with `<$fh>`
+  and lets the JSON layer encode those bytes a second time. That is upstream of
+  this addon, and `cat` on `/var/log/pve/tasks/…` shows the real thing.
+
 ## Permissions
 
 | Action | Needs |
@@ -181,9 +444,11 @@ re-parsed by another shell. On the node it runs directly, in a container through
 | edit templates | `Sys.Modify` on `/` |
 | write settings to every node | `Sys.Console` on every node |
 
-The datacenter list is built from Proxmox' cluster resource index, so it shows
-exactly what the user may already see. The host row is never picked by *Select
-All Containers*.
+The datacenter list is built from Proxmox' cluster resource index. That index
+filters **guests** by `VM.Audit` and returns every **node** whatever the user
+may see — it only leaves a node's statistics out — so the node rows are filtered
+against `Sys.Audit` here, the same way the node tab does it. The host row is
+never picked by *Select All Containers*.
 
 ## API
 
@@ -195,6 +460,13 @@ pvesh delete /nodes/pve/lxc/101/updatemgr/script
 pvesh delete /nodes/pve/lxc/101/updatemgr/script --purge 1   # also the last-run state
 
 # the node's own commands: same three, under /nodes/pve/updatemgr/script
+
+# the saved versions of those commands, and one of them
+pvesh get /nodes/pve/lxc/101/updatemgr/script/versions
+pvesh get /nodes/pve/lxc/101/updatemgr/script/versions/1755690000
+
+# where a target sits in a run
+pvesh set /nodes/pve/lxc/101/updatemgr/order --order 10
 
 # run
 pvesh create /nodes/pve/lxc/101/updatemgr/run
@@ -216,9 +488,14 @@ Good to know:
 - `run` returns a UPID; it also lands in the target's `last_upid`, which is what
   the 📄 button opens.
 - A container with no script stored starts no task and is recorded as `skipped`.
+- So is one whose config is not on this node — it has migrated away, or the vmid
+  names a VM. The scripts live in `/etc/pve` and are the same everywhere, so it
+  would otherwise be found and reported as "not running".
+- `run --script ...` stores before running and therefore needs
+  `VM.Config.Options` on top of `VM.Console`.
 - Storing an empty script is refused; removing is its own operation.
-- Removing a script keeps the recorded last run. Wipe it with
-  `rm /etc/pve/pve-update-manager/lxc-101.state`, or use `--purge 1`.
+- Removing a script keeps the recorded last run and the history. `--purge 1`
+  takes those, the saved versions and the order with it.
 - There is no cluster-wide `run`: the UI fires one `POST` per node in parallel.
 - A single container goes to its own endpoint, so its task is typed `ctupdate`
   and reads *CT 102 — Update Manager* in the task list.
@@ -229,14 +506,18 @@ Good to know:
 | --- | --- |
 | `/etc/pve/pve-update-manager/lxc-<vmid>.conf` | a container's update commands |
 | `/etc/pve/pve-update-manager/node-<node>.conf` | the host's update commands |
+| `/etc/pve/pve-update-manager/*@<date>-<time>[-<user>].conf` | a saved version of those commands |
+| `/etc/pve/pve-update-manager/*.order` | that target's place in a run |
 | `/etc/pve/pve-update-manager/*.state` | how that target's last run ended |
 | `/etc/pve/pve-update-manager/settings-<node>.conf` | that node's settings |
 | `/etc/pve/pve-update-manager/templates.conf` | the Templates menu, once changed |
 | `/usr/share/pve-manager/js/pve-update-manager.js` | the web interface code |
+| `/usr/share/pve-manager/templates/default/pve-update-manager-*.hbs` | the text of the failure notification |
 | `/usr/share/perl5/PVE/UpdateManager/*.pm` | the API |
 | `/usr/sbin/pve-update-manager-hooks` | applies / removes the integration |
 | `/usr/sbin/pve-update-manager-schedule` | what the timer runs |
 | `/usr/lib/systemd/system/pve-update-manager.timer` | five-minute due check |
+| `/var/lib/pve-update-manager/logs/*@<date>-<time>.log` | the kept log of one run of one target |
 | `/var/lib/pve-update-manager/backup/` | copies taken before editing |
 
 Everything under `/etc/pve` is cluster-replicated and plain text:

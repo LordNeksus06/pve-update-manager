@@ -13,11 +13,19 @@ our %CONFIGS;
 our %LOCKS;
 our $SET_LOCK_DIE;
 
+# Which vmids this node has no config for. The real load_config dies there, and
+# that is how a container that has been migrated away - or a vmid that names a
+# VM - is told apart from one that is simply switched off.
+our %NO_CONFIG;
+
 # The vmid is stamped into the config the real one does not carry, so the
 # has_feature stub below can tell which container it is being asked about - the
 # real has_feature gets that from the volumes it walks, which a stub has none of.
 sub load_config {
     my ($class, $vmid) = @_;
+
+    die "Configuration file 'nodes/pve-test/lxc/$vmid.conf' does not exist\n"
+        if $NO_CONFIG{$vmid};
 
     my $conf = $CONFIGS{$vmid} ||= {};
     $conf->{vmid} = $vmid;
@@ -32,6 +40,28 @@ sub load_config {
     }
 
     return $conf;
+}
+
+# The real one, from PVE::AbstractConfig: a template is `template: 1` in the
+# config, and nothing else counts as one.
+sub is_template {
+    my ($class, $conf) = @_;
+
+    return 1 if defined($conf->{template}) && $conf->{template} == 1;
+
+    return 0;
+}
+
+# Where the stub pretends the container configs live. The real config_file
+# returns a path under /etc/pve, and its mtime is what tells an abandoned
+# snapshot removal from one that is still running - so a test needs a real file
+# whose mtime it can set.
+our $CONFIG_DIR = '/nonexistent';
+
+sub config_file {
+    my ($class, $vmid) = @_;
+
+    return "$CONFIG_DIR/$vmid.conf";
 }
 
 sub set_lock {
@@ -98,6 +128,25 @@ sub snapshot_create {
         snaptime => $SNAPTIME++,
         description => $comment,
     };
+
+    return;
+}
+
+# Lets a test take the path where the rollback itself fails.
+our $ROLLBACK_DIE;
+
+# Faithful to the real one in the two ways that decide the caller's code: it
+# refuses while a lock is set, and it STOPS the container and leaves it stopped.
+sub snapshot_rollback {
+    my ($class, $vmid, $snapname) = @_;
+
+    die "$ROLLBACK_DIE\n" if defined($ROLLBACK_DIE);
+    die "snapshot '$snapname' does not exist\n"
+        if !$CONFIGS{$vmid}->{snapshots}->{$snapname};
+    die "CT is locked ($LOCKS{$vmid})\n" if $LOCKS{$vmid};
+
+    $PVE::LXC::RUNNING{$vmid} = undef;
+    $CONFIGS{$vmid}->{rolled_back_to} = $snapname;
 
     return;
 }

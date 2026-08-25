@@ -10,7 +10,7 @@ use strict;
 use warnings;
 
 use File::Temp qw(tempdir);
-use Test::More tests => 68;
+use Test::More tests => 147;
 
 use PVE::LXC;
 use PVE::LXC::Config;
@@ -338,12 +338,35 @@ my $ON = { snapshot_before => 1, snapshot_keep => 3 };
 
     is_deeply(
         [sort keys %$opts],
-        ['snapshot_before', 'snapshot_keep', 'start_stopped'],
+        ['notify_failure', 'parallel', 'rollback_on_failure', 'run_logs',
+            'snapshot_before', 'snapshot_keep', 'snapshot_shutdown', 'start_stopped'],
         'every setting a run acts on is carried into it',
     );
     is($opts->{snapshot_before}, 1, 'and snapshots before an update are on by default');
     is($opts->{snapshot_keep}, 3, 'keeping the last few of them');
     is($opts->{start_stopped}, 0, 'while starting a stopped container is still not');
+    is($opts->{notify_failure}, 1, 'and a failed run says so by default');
+    is($opts->{run_logs}, 3, 'and a run keeps the last three of its own logs');
+
+    # There is no single settings key to read here: a manual run and a scheduled
+    # one have separate parallel switches, and a single container's run has no
+    # list to spread out at all. So it is an argument, and a caller that forgets
+    # it gets the serial walk - the one that behaves as it always did.
+    is($opts->{parallel}, 0, 'a caller that says nothing gets a serial run');
+    is(
+        PVE::UpdateManager::Config::run_opts(
+            PVE::UpdateManager::Config::default_settings(), 1,
+        )->{parallel},
+        1,
+        'and one that asks for parallel gets it',
+    );
+    is(
+        PVE::UpdateManager::Config::run_opts(
+            { %{ PVE::UpdateManager::Config::default_settings() }, notify_failure => 0 },
+        )->{notify_failure},
+        0,
+        'switching the notification off is carried in too',
+    );
 }
 
 # ── a container somebody else has locked ────────────────────────────────────
@@ -506,4 +529,538 @@ my $ON = { snapshot_before => 1, snapshot_keep => 3 };
     is($PVE::LXC::Config::LOCKS{101}, 'backup', "somebody else's lock is left alone");
     ok(!$repaired, 'so the half-deleted snapshot is reported as stuck instead of forced');
     like(join("\n", @log), qr/not ours to remove/, 'and the log says why nothing was done');
+}
+
+# ── a wedge from an earlier run is undone by the next update ────────────────
+#
+# The repair above only runs when a removal fails DURING a run. A container
+# that is already locked never gets that far: the pre-check skips it, and it
+# would be skipped every run from then on. So a 'snapshot-delete' lock that
+# nobody has touched for long enough is treated as the wreck it is.
+#
+# The clock is the config file's mtime, because a removal that is really
+# running writes that file several times as it goes.
+{
+    my $confdir = tempdir(CLEANUP => 1);
+    local $PVE::LXC::Config::CONFIG_DIR = $confdir;
+    PVE::Tools::file_set_contents("$confdir/101.conf", "stub\n");
+
+    local %PVE::LXC::Config::LOCKS = (101 => 'snapshot-delete');
+    $PVE::LXC::Config::CONFIGS{101}->{snapshots} = {
+        'updmgr-20260101-000000' => { snaptime => 100, snapstate => 'delete' },
+    };
+
+    # Written a moment ago: something may well be working on it right now.
+    utime(time(), time(), "$confdir/101.conf");
+    is(
+        PVE::UpdateManager::Runner::stale_delete_wedge(101),
+        undef,
+        'a removal that is still writing the config is left alone',
+    );
+
+    # Untouched for an hour: nothing is working on it.
+    my $old = time() - 3600;
+    utime($old, $old, "$confdir/101.conf");
+    is(
+        PVE::UpdateManager::Runner::stale_delete_wedge(101),
+        'updmgr-20260101-000000',
+        'one that has not been touched for an hour is a wreck, and it is named',
+    );
+
+    # Somebody else's lock is not a wedge whatever its age.
+    $PVE::LXC::Config::LOCKS{101} = 'backup';
+    is(
+        PVE::UpdateManager::Runner::stale_delete_wedge(101),
+        undef,
+        "and a 'backup' lock is never one",
+    );
+
+    # Nor is a stale lock over a snapshot that is not ours.
+    $PVE::LXC::Config::LOCKS{101} = 'snapshot-delete';
+    $PVE::LXC::Config::CONFIGS{101}->{snapshots} = {
+        'before-migration' => { snaptime => 100, snapstate => 'delete' },
+    };
+    is(
+        PVE::UpdateManager::Runner::stale_delete_wedge(101),
+        undef,
+        'nor a half-deleted snapshot somebody else made',
+    );
+}
+
+# And the whole way round: a container left locked by an earlier run updates
+# again instead of being skipped for ever.
+{
+    local @PVE::Tools::RUN_CALLS = ();
+    local $PVE::Tools::RUN_RC = 0;
+
+    my $confdir = tempdir(CLEANUP => 1);
+    local $PVE::LXC::Config::CONFIG_DIR = $confdir;
+    PVE::Tools::file_set_contents("$confdir/101.conf", "stub\n");
+    my $old = time() - 3600;
+    utime($old, $old, "$confdir/101.conf");
+
+    local %PVE::LXC::Config::LOCKS = (101 => 'snapshot-delete');
+    $PVE::LXC::Config::CONFIGS{101}->{snapshots} = {
+        'updmgr-20260101-000000' => { snaptime => 100, snapstate => 'delete' },
+    };
+
+    my ($out, $err) = run({ type => 'lxc', id => 101 }, { snapshot_before => 1, snapshot_keep => 2 });
+
+    ok(!defined($err), 'the run goes through instead of being skipped');
+    ok(scalar(@PVE::Tools::RUN_CALLS), 'and the update really ran');
+    like($out, qr/did not finish - repairing it/, 'the log says what it repaired');
+    ok(
+        !grep({ $_ eq 'updmgr-20260101-000000' } @{ snapshots_of(101) }),
+        'the half-deleted snapshot is gone',
+    );
+    is(
+        PVE::UpdateManager::Config::load_state('lxc', 101)->{state},
+        'ok',
+        'and the container is updated rather than reported as locked',
+    );
+}
+
+# ── a cold snapshot: stop, snapshot, start, then update ─────────────────────
+#
+# An LXC snapshot never holds memory, so a running container is caught as if the
+# power had been pulled. The setting buys consistency with downtime, which is
+# why what matters here is the SEQUENCE - and above all that the container is
+# started again on every path out, including the ones where something failed.
+
+# Which pct verb each recorded call was, in order. The update and the readiness
+# probe are both `pct exec` and are told apart by the script they carry.
+sub verbs {
+    return map {
+        my $c = $_->{cmd};
+        my $verb = $c->[1] // '';
+        if ($verb eq 'exec') {
+            $verb = ($c->[6] // '') eq $PVE::UpdateManager::Runner::ONLINE_PROBE
+                ? 'probe'
+                : 'update';
+        }
+        $verb;
+    } @PVE::Tools::RUN_CALLS;
+}
+
+my $COLD = { snapshot_before => 1, snapshot_keep => 3, snapshot_shutdown => 1 };
+
+{
+    local @PVE::Tools::RUN_CALLS = ();
+    local $PVE::Tools::RUN_RC = 0;
+    delete $PVE::LXC::Config::CONFIGS{101}->{snapshots};
+
+    # What existed at the moment the update itself ran.
+    my $during;
+    local $PVE::Tools::RUN_HOOK = sub {
+        my ($cmd) = @_;
+        return if ($cmd->[1] // '') ne 'exec';
+        return if ($cmd->[6] // '') eq $PVE::UpdateManager::Runner::ONLINE_PROBE;
+        $during = snapshots_of(101);
+    };
+
+    my ($out, $err) = run({ type => 'lxc', id => 101, name => 'db' }, $COLD);
+
+    ok(!defined($err), 'the run succeeds');
+    is_deeply(
+        [verbs()],
+        ['shutdown', 'start', 'probe', 'update'],
+        'the container is shut down, snapshotted, started again, and only then updated',
+    );
+    is(scalar(@{ snapshots_of(101) }), 1, 'one snapshot was taken');
+    is(scalar(@{ $during // [] }), 1, 'and it existed before the update ran');
+    like($out, qr/shutting the container down for a consistent snapshot/, 'the log says why it stopped');
+    like($out, qr/starting the container again/, 'and that it came back');
+    is(
+        PVE::UpdateManager::Config::load_state('lxc', 101)->{state},
+        'ok',
+        'the row records the update',
+    );
+}
+
+# Without the setting nothing is switched off - the default has to stay exactly
+# what it was before this existed.
+{
+    local @PVE::Tools::RUN_CALLS = ();
+    local $PVE::Tools::RUN_RC = 0;
+    delete $PVE::LXC::Config::CONFIGS{101}->{snapshots};
+
+    run({ type => 'lxc', id => 101, name => 'db' }, $ON);
+
+    is_deeply([verbs()], ['update'], 'off by default: the container is snapshotted while it runs');
+}
+
+# A container that was found stopped is already as cold as it gets. Shutting it
+# down again would be a `pct shutdown` on something that is not running, and
+# starting it for the update is the other setting's job.
+{
+    local @PVE::Tools::RUN_CALLS = ();
+    local $PVE::Tools::RUN_RC = 0;
+    delete $PVE::LXC::Config::CONFIGS{102}->{snapshots};
+
+    my ($out, $err) = run(
+        { type => 'lxc', id => 102, name => 'off-one' },
+        { %$COLD, start_stopped => 1 },
+    );
+
+    ok(!defined($err), 'a stopped container is updated');
+    is_deeply(
+        [verbs()],
+        ['start', 'probe', 'update', 'shutdown'],
+        'and is started once, for the update, not twice',
+    );
+    is(scalar(@{ snapshots_of(102) }), 1, 'it is still snapshotted, and while it is off');
+}
+
+# The shutdown fails: the run is refused rather than quietly falling back to a
+# snapshot of a running container, which is the one thing the setting promises.
+{
+    local @PVE::Tools::RUN_CALLS = ();
+    local $PVE::Tools::RUN_RC = 1;
+    delete $PVE::LXC::Config::CONFIGS{101}->{snapshots};
+
+    my ($out, $err) = run({ type => 'lxc', id => 101, name => 'db' }, $COLD);
+
+    like($err // '', qr/1 of 1 update targets failed/, 'the task goes red');
+    is_deeply(snapshots_of(101), [], 'nothing was snapshotted');
+    ok(!grep({ $_ eq 'update' } verbs()), 'and the update never started');
+    my $state = PVE::UpdateManager::Config::load_state('lxc', 101);
+    is($state->{state}, 'failed', 'the row is failed');
+    like($state->{note}, qr/could not be shut down for its snapshot/, 'and says what did not happen');
+    ok(!defined($PVE::LXC::Config::LOCKS{101}), 'no update lock was left behind');
+}
+
+# The snapshot fails after the container is already off. The failure is
+# reported - but only after the container is running again, because a container
+# left switched off is worse than the failure that caused it.
+{
+    local @PVE::Tools::RUN_CALLS = ();
+    local $PVE::Tools::RUN_RC = 0;
+    local $PVE::LXC::Config::SNAPSHOT_DIE = 'storage is full';
+    delete $PVE::LXC::Config::CONFIGS{101}->{snapshots};
+
+    my ($out, $err) = run({ type => 'lxc', id => 101, name => 'db' }, $COLD);
+
+    like($err // '', qr/1 of 1 update targets failed/, 'the task goes red');
+    is_deeply(
+        [verbs()],
+        ['shutdown', 'start', 'probe'],
+        'the container is put back up before anything is reported, and is not updated',
+    );
+    like(
+        PVE::UpdateManager::Config::load_state('lxc', 101)->{note},
+        qr/could not be snapshotted before the update - storage is full/,
+        'and the row carries the storage\'s reason',
+    );
+}
+
+# The container will not come back up. That is a failure of its own, and it must
+# not be hidden behind a successful snapshot.
+{
+    local @PVE::Tools::RUN_CALLS = ();
+    delete $PVE::LXC::Config::CONFIGS{101}->{snapshots};
+    # Everything works except the start.
+    local $PVE::Tools::RUN_RC_HOOK = sub {
+        my ($cmd) = @_;
+        return 1 if ($cmd->[1] // '') eq 'start';
+        return 0;
+    };
+
+    my ($out, $err) = run({ type => 'lxc', id => 101, name => 'db' }, $COLD);
+
+    like($err // '', qr/1 of 1 update targets failed/, 'the task goes red');
+    ok(!grep({ $_ eq 'update' } verbs()), 'the update does not run on a container that is down');
+    like(
+        PVE::UpdateManager::Config::load_state('lxc', 101)->{note},
+        qr/could not be started again after its snapshot/,
+        'and the row says exactly that, not "the update failed"',
+    );
+    ok(!defined($PVE::LXC::Config::LOCKS{101}), 'and no lock is left on it');
+}
+
+# A storage that cannot snapshot must not cost the container its uptime: there
+# is nothing to be consistent for.
+{
+    local @PVE::Tools::RUN_CALLS = ();
+    local $PVE::Tools::RUN_RC = 0;
+    local $PVE::LXC::Config::NO_SNAPSHOT{101} = 1;
+    delete $PVE::LXC::Config::CONFIGS{101}->{snapshots};
+
+    my ($out, $err) = run({ type => 'lxc', id => 101, name => 'db' }, $COLD);
+
+    ok(!defined($err), 'the container is updated');
+    is_deeply([verbs()], ['update'], 'and is never switched off for a snapshot it cannot have');
+}
+
+# The worst thing this setting could do is leave a container off that was found
+# running. It must not happen even when the update itself fails.
+{
+    local @PVE::Tools::RUN_CALLS = ();
+    delete $PVE::LXC::Config::CONFIGS{101}->{snapshots};
+    # The update fails; the shutdown, the snapshot and the start all work.
+    local $PVE::Tools::RUN_RC_HOOK = sub {
+        my ($cmd) = @_;
+        return 1 if ($cmd->[1] // '') eq 'exec'
+            && ($cmd->[6] // '') ne $PVE::UpdateManager::Runner::ONLINE_PROBE;
+        return 0;
+    };
+
+    my ($out, $err) = run({ type => 'lxc', id => 101, name => 'db' }, { %$COLD, start_stopped => 1 });
+
+    like($err // '', qr/1 of 1 update targets failed/, 'the failed update is reported');
+    is_deeply(
+        [verbs()],
+        ['shutdown', 'start', 'probe', 'update'],
+        'and the container is NOT stopped again at the end - it was found running',
+    );
+    ok(!defined($PVE::LXC::Config::LOCKS{101}), 'the update lock is given back');
+    like(
+        PVE::UpdateManager::Config::load_state('lxc', 101)->{note},
+        qr/snapshot updmgr-/,
+        'and the row names the snapshot to roll back to',
+    );
+}
+
+# ── two runs of one container inside the same second ────────────────────────
+#
+# The name carries a whole second, and PVE refuses one it already has. Pressing
+# Update twice on a container whose script finishes instantly used to fail the
+# second run before it started - "snapshot ... already exists" - which sounds
+# like the storage and is not about the storage.
+{
+    local @PVE::Tools::RUN_CALLS = ();
+    local $PVE::Tools::RUN_RC = 0;
+    delete $PVE::LXC::Config::CONFIGS{101}->{snapshots};
+
+    my $fixed = 1786817167;    # both runs are told the same second
+
+    my ($out1, $err1) = capture(
+        sub {
+            PVE::UpdateManager::Job::run_one(
+                { type => 'lxc', id => 101, name => 'db' }, 60, undef, $ON,
+            );
+        },
+    );
+    my ($out2, $err2) = capture(
+        sub {
+            PVE::UpdateManager::Job::run_one(
+                { type => 'lxc', id => 101, name => 'db' }, 60, undef, $ON,
+            );
+        },
+    );
+
+    ok(!defined($err1) && !defined($err2), 'neither run dies');
+    is(
+        PVE::UpdateManager::Config::load_state('lxc', 101)->{state},
+        'ok',
+        'the second run is updated rather than refused over a name',
+    );
+    is(scalar(@{ snapshots_of(101) }), 2, 'and both runs left a rollback point');
+
+    # The same, driven straight at the runner with one fixed second, so it does
+    # not depend on how fast the machine running the test is.
+    delete $PVE::LXC::Config::CONFIGS{101}->{snapshots};
+    my $first = PVE::UpdateManager::Runner::snapshot_lxc(101, undef, $fixed);
+    my $second = PVE::UpdateManager::Runner::snapshot_lxc(101, undef, $fixed);
+    isnt($second, $first, 'the second name is moved forward rather than reused');
+    ok(
+        PVE::UpdateManager::Runner::is_our_snapshot($second),
+        'and it is still recognisably one of ours, so pruning still sees it',
+    );
+    is(scalar(@{ snapshots_of(101) }), 2, 'both exist');
+
+    # Beyond the retry budget it gives up and lets PVE say why, rather than
+    # looping around a container somebody has filled with our names by hand.
+    delete $PVE::LXC::Config::CONFIGS{101}->{snapshots};
+    $PVE::LXC::Config::CONFIGS{101}->{snapshots} = {
+        map { (PVE::UpdateManager::Runner::snapshot_name($fixed + $_) => { snaptime => $_ }) }
+            (0 .. $PVE::UpdateManager::Runner::SNAPSHOT_NAME_TRIES)
+    };
+    ok(
+        !defined(eval { PVE::UpdateManager::Runner::snapshot_lxc(101, undef, $fixed) }),
+        'a name it cannot find room for is still an error',
+    );
+
+    delete $PVE::LXC::Config::CONFIGS{101}->{snapshots};
+}
+
+# ── our own lock, left behind by a worker that was killed ───────────────────
+#
+# unlock_guest is never reached when a worker is killed - a node reboot, an
+# out-of-memory kill - and the 'mounted' lock stays on the container. Every run
+# after that skips it with "another task holds the lock (mounted)", for ever,
+# and nothing says what would clear it.
+#
+# The lock is deliberately NOT taken off: 'mounted' is a value PVE sets itself
+# for `pct mount`, and a container whose rootfs is mounted on the host is the
+# last one to start writing into from a second direction. What changes is the
+# sentence in the row.
+{
+    my $confdir = tempdir(CLEANUP => 1);
+    local $PVE::LXC::Config::CONFIG_DIR = $confdir;
+    PVE::Tools::file_set_contents("$confdir/101.conf", "stub\n");
+
+    local %PVE::LXC::Config::LOCKS = (101 => $PVE::UpdateManager::Runner::LXC_LOCK);
+
+    # Freshly written: somebody may well be working under this lock right now.
+    is(PVE::UpdateManager::Runner::stale_own_lock(101), 0, 'a fresh lock is not abandoned');
+
+    my ($fresh) = run({ type => 'lxc', id => 101 }, $ON);
+    like($fresh, qr/another task holds the lock \(mounted\)/, 'and the row says only that');
+    unlike($fresh, qr/pct unlock/, 'with no advice to clear somebody else\'s lock');
+
+    # Untouched for an hour. A removal or a mount somebody is working under
+    # writes that config as it goes; this one has not been written at all.
+    my $old = time() - 3600;
+    utime($old, $old, "$confdir/101.conf");
+
+    is(PVE::UpdateManager::Runner::stale_own_lock(101), 1, 'an hour untouched is abandoned');
+
+    my ($stale) = run({ type => 'lxc', id => 101 }, $ON);
+    like($stale, qr/may be left over from an update that was interrupted/, 'the row says so');
+    like($stale, qr/pct unlock 101/, 'and names the command that clears it');
+    is(
+        $PVE::LXC::Config::LOCKS{101},
+        $PVE::UpdateManager::Runner::LXC_LOCK,
+        'the lock itself is left exactly where it was',
+    );
+
+    # A lock that is not ours is never described as ours, however old it is.
+    local %PVE::LXC::Config::LOCKS = (101 => 'backup');
+    is(PVE::UpdateManager::Runner::stale_own_lock(101), 0, 'a backup lock is not our leftover');
+    my ($backup) = run({ type => 'lxc', id => 101 }, $ON);
+    unlike($backup, qr/pct unlock/, 'and gets no advice to clear it');
+}
+
+# ── rolling a failed update back ────────────────────────────────────────────
+#
+# Off by default, and it has to be: a rollback throws away everything that
+# happened since the snapshot, not only what the update did. What is pinned here
+# is that it fires on a FAILED run and on nothing else, that it goes to the
+# snapshot THIS run took, and that the container ends up in the state it was
+# found in - PVE stops it to roll it back and leaves it stopped.
+my $ROLL = { snapshot_before => 1, snapshot_keep => 3, rollback_on_failure => 1 };
+
+{
+    local @PVE::Tools::RUN_CALLS = ();
+    local $PVE::Tools::RUN_RC = 0;
+    local %PVE::LXC::RUNNING = (101 => 4711);
+    delete $PVE::LXC::Config::CONFIGS{101}->{snapshots};
+    delete $PVE::LXC::Config::CONFIGS{101}->{rolled_back_to};
+
+    my ($out, $err) = run({ type => 'lxc', id => 101, name => 'db' }, $ROLL);
+
+    ok(!defined($err), 'an update that WORKS is not rolled back');
+    ok(!$PVE::LXC::Config::CONFIGS{101}->{rolled_back_to}, 'nothing was rolled back');
+    unlike($out, qr/rolling the container back/, 'and nothing was said about it');
+}
+
+{
+    local @PVE::Tools::RUN_CALLS = ();
+    local $PVE::Tools::RUN_RC = 1;
+    local %PVE::LXC::RUNNING = (101 => 4711);
+    delete $PVE::LXC::Config::CONFIGS{101}->{snapshots};
+    delete $PVE::LXC::Config::CONFIGS{101}->{rolled_back_to};
+
+    my ($out, $err) = run({ type => 'lxc', id => 101, name => 'db' }, $ROLL);
+
+    like($err // '', qr/1 of 1 update targets failed/, 'the run still reports the failure');
+    my $snapshot = $PVE::LXC::Config::CONFIGS{101}->{rolled_back_to};
+    ok($snapshot, 'the container was rolled back');
+    ok(
+        PVE::UpdateManager::Runner::is_our_snapshot($snapshot // ''),
+        'to a snapshot this addon took',
+    );
+    like($out, qr/the update failed - rolling the container back/, 'the log says why');
+
+    my $state = PVE::UpdateManager::Config::load_state('lxc', 101);
+    like($state->{note}, qr/rolled back to $snapshot/, 'and the row says what happened');
+    unlike(
+        $state->{note},
+        qr/, snapshot $snapshot/,
+        'not "here is a snapshot to roll back to" - that would invite doing it twice',
+    );
+
+    # Found running, so it has to end running: PVE stops a container to roll it
+    # back and leaves it stopped. What proves it here is the pct call - the stub
+    # records commands rather than running them, so its idea of "running" would
+    # only be its own bookkeeping.
+    is(
+        (verbs())[-1],
+        'start',
+        'a container that was running is started again after the rollback',
+    );
+    ok(!defined($PVE::LXC::Config::LOCKS{101}), 'no lock is left on it');
+}
+
+# Off by default: the snapshot is named on the row and nothing is undone.
+{
+    local @PVE::Tools::RUN_CALLS = ();
+    local $PVE::Tools::RUN_RC = 1;
+    local %PVE::LXC::RUNNING = (101 => 4711);
+    delete $PVE::LXC::Config::CONFIGS{101}->{snapshots};
+    delete $PVE::LXC::Config::CONFIGS{101}->{rolled_back_to};
+
+    run({ type => 'lxc', id => 101, name => 'db' }, $ON);
+
+    ok(!$PVE::LXC::Config::CONFIGS{101}->{rolled_back_to}, 'without the setting, nothing is undone');
+    like(
+        PVE::UpdateManager::Config::load_state('lxc', 101)->{note},
+        qr/, snapshot updmgr-/,
+        'and the row names the snapshot to roll back to by hand',
+    );
+}
+
+# A container that was found stopped stays stopped afterwards - it was only
+# started for the update in the first place.
+{
+    local @PVE::Tools::RUN_CALLS = ();
+    local $PVE::Tools::RUN_RC_HOOK = sub {
+        my ($cmd) = @_;
+        return 1 if ($cmd->[1] // '') eq 'exec'
+            && ($cmd->[6] // '') ne $PVE::UpdateManager::Runner::ONLINE_PROBE;
+        return 0;
+    };
+    local %PVE::LXC::RUNNING = (102 => undef);
+    delete $PVE::LXC::Config::CONFIGS{102}->{snapshots};
+    delete $PVE::LXC::Config::CONFIGS{102}->{rolled_back_to};
+
+    run({ type => 'lxc', id => 102, name => 'off-one' }, { %$ROLL, start_stopped => 1 });
+
+    ok($PVE::LXC::Config::CONFIGS{102}->{rolled_back_to}, 'it is rolled back too');
+    ok(!$PVE::LXC::RUNNING{102}, 'and left stopped, which is how it was found');
+    ok(
+        !grep({ $_ eq 'shutdown' } verbs()),
+        'without a shutdown of a container the rollback already stopped',
+    );
+}
+
+# The rollback itself failing must be said out loud - the row would otherwise
+# report a plain failed update and the operator would never know the container
+# is not the one the update left behind.
+{
+    local @PVE::Tools::RUN_CALLS = ();
+    local $PVE::Tools::RUN_RC = 1;
+    local %PVE::LXC::RUNNING = (101 => 4711);
+    local $PVE::LXC::Config::ROLLBACK_DIE = 'storage is busy';
+    delete $PVE::LXC::Config::CONFIGS{101}->{snapshots};
+    delete $PVE::LXC::Config::CONFIGS{101}->{rolled_back_to};
+
+    my ($out) = run({ type => 'lxc', id => 101, name => 'db' }, $ROLL);
+
+    like($out, qr/WARNING: rolling back to updmgr-\S+ failed - storage is busy/, 'the log says so');
+    like(
+        PVE::UpdateManager::Config::load_state('lxc', 101)->{note},
+        qr/the rollback to it FAILED/,
+        'and so does the row',
+    );
+}
+
+# Never to a snapshot somebody else made, whatever is asked of it.
+{
+    ok(
+        !defined(eval {
+            PVE::UpdateManager::Runner::rollback_lxc(101, 'before-migration', undef);
+        }),
+        'a snapshot that is not ours is refused',
+    );
 }

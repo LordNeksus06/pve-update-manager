@@ -1,0 +1,24 @@
+<html>
+    <body>
+        {{status-text}}
+        <h1 style="font-size: 1.2em">Result</h1>
+        Succeeded: {{ok}} of {{total}} targets<br/>
+        Failed: {{failed}} of {{total}}<br/>
+        Skipped: {{skipped}} of {{total}}<br/>
+        Running time: {{duration total-time}}
+        <h1 style="font-size: 1.2em">Details</h1>
+        {{#each failed-targets}}
+        <p>
+            <b>{{this.target}}</b><br/>
+            Failed at: {{timestamp this.finished}}<br/>
+            Took: {{duration this.ran}}<br/>
+            Exit code: {{this.exit}} ({{this.outcome}})<br/>
+            Snapshot: {{this.snapshot}}<br/>
+            Rolled back: {{this.rollback}}<br/>
+            Also: {{this.also}}
+        </p>
+        {{/each}}
+        <h1 style="font-size: 1.2em">Task</h1>
+        <pre>{{upid}}</pre>
+    </body>
+</html>

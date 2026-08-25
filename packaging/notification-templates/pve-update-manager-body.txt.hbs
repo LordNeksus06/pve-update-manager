@@ -1,0 +1,24 @@
+{{status-text}}
+
+Result
+======
+Succeeded:    {{ok}} of {{total}} targets
+Failed:       {{failed}} of {{total}}
+Skipped:      {{skipped}} of {{total}}
+Running time: {{duration total-time}}
+
+Details
+=======
+{{#each failed-targets}}
+{{this.target}}
+  Failed at:   {{timestamp this.finished}}
+  Took:        {{duration this.ran}}
+  Exit code:   {{this.exit}} ({{this.outcome}})
+  Snapshot:    {{this.snapshot}}
+  Rolled back: {{this.rollback}}
+  Also:        {{this.also}}
+
+{{/each}}
+Task
+====
+{{upid}}

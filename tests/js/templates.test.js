@@ -164,4 +164,34 @@ claim('managing the templates is offered to Sys.Modify on / and to nobody else',
     assert.strictEqual(nothing.updmgr.canManageTemplates(), false);
 });
 
+claim('a template name is text in the menu, not markup in the page', () => {
+    const { updmgr } = load(() => ({}));
+
+    // The name is free text somebody with Sys.Modify on / typed, and reading the
+    // menu takes no privilege at all - every logged-in user opens it. A menu
+    // item's text is rendered as HTML, so this is the widest exposure the addon
+    // has.
+    const { items } = itemsFor(updmgr, {
+        custom: true,
+        templates: [{ name: '<img src=x onerror="boom">', script: 'true\n' }],
+    });
+
+    assert.ok(!items[0].text.includes('<img'), `raw tag in a menu entry: ${items[0].text}`);
+    assert.ok(items[0].text.includes('&lt;img'), 'it is shown as text instead');
+});
+
+claim('and picking it still pastes the script it names', () => {
+    const { updmgr } = load(() => ({}));
+
+    const { items, applied } = itemsFor(updmgr, {
+        custom: true,
+        templates: [{ name: '<b>x</b>', script: 'the commands\n' }],
+    });
+
+    items[0].handler();
+
+    // Escaping the label must not touch what the entry is FOR.
+    assert.deepStrictEqual(applied, ['the commands\n']);
+});
+
 done();

@@ -39,7 +39,8 @@ my $settings = PVE::UpdateManager::Config::load_settings($nodename);
 
 # The same options a manual run gets, from the same function, so an unattended
 # run cannot quietly behave differently from the one the operator tried by hand.
-my $opts = PVE::UpdateManager::Config::run_opts($settings);
+# The scheduled parallel switch is its own, and this is where it is answered.
+my $opts = PVE::UpdateManager::Config::run_opts($settings, $settings->{schedule_parallel});
 
 # Everything the schedule points at, in the order the manual runs use.
 sub collect_targets {
@@ -122,55 +123,41 @@ my $count = scalar(@$targets);
 my $mode = $settings->{schedule_parallel} ? 'parallel' : 'serial';
 syslog('info', "starting scheduled update of $count target(s), $mode");
 
-# The 5th argument to fork_worker is `$background`, and leaving it out here was
-# a silent bug: PVE::RESTEnvironment computes
+# ONE worker for the whole run, in both modes. A parallel run is a parallel run
+# inside that worker - it starts everything sharing an update-order number at
+# once and waits for the position to finish before the next one - so the two
+# modes differ in one flag in $opts and in nothing here.
+#
+# It used to be one worker per target in parallel mode. Two things were wrong
+# with that and neither was visible from here: the update order did nothing,
+# because no worker ever saw more than one target to put in an order; and nothing
+# knew when the run as a whole was over, which is what a notification about it
+# needs.
+#
+# The 5th argument to fork_worker is `$background`, and leaving it out was a
+# silent bug: PVE::RESTEnvironment computes
 #
 #     my $sync = ($self->{type} eq 'cli' && !$background) ? 1 : 0;
 #
-# and setup_default_cli_env() builds a 'cli' environment - so every call ran
-# SYNCHRONOUSLY. The parallel loop below then waited for each dist-upgrade
-# before starting the next one (making the checkbox do nothing for scheduled
-# runs), "started $upid" was logged after the run had already finished, and the
-# timer's oneshot service stayed active for the whole thing.
-if ($settings->{schedule_parallel}) {
-    # One worker per target, exactly like ticking them all in the web interface
-    # with the parallel button: each gets its own task, its own log and its own
-    # recorded state.
-    for my $target (@$targets) {
-        my $type = $target->{type} eq 'node' ? 'updatemgr' : 'ctupdate';
-        my $upid = eval {
-            $rpcenv->fork_worker(
-                $type,
-                $target->{id},
-                'root@pam',
-                sub { PVE::UpdateManager::Job::run_all([$target], $settings->{timeout}, $opts) },
-                1,    # background
-            );
-        };
-        if (my $err = $@) {
-            syslog('err', "unable to start the scheduled update of $target->{type} $target->{id}: $err");
-        } else {
-            syslog('info', "started $upid");
-        }
-    }
-} else {
-    my $upid = eval {
-        $rpcenv->fork_worker(
-            'updatemgr',
-            $nodename,
-            'root@pam',
-            sub { PVE::UpdateManager::Job::run_all($targets, $settings->{timeout}, $opts) },
-            1,    # background
-        );
-    };
-    if (my $err = $@) {
-        syslog('err', "unable to start the scheduled update: $err");
-        exit 1;
-    }
-    syslog('info', "started $upid");
+# and setup_default_cli_env() builds a 'cli' environment - so the call ran
+# SYNCHRONOUSLY. "started $upid" was then logged after the run had already
+# finished, and the timer's oneshot service stayed active for the whole thing.
+my $upid = eval {
+    $rpcenv->fork_worker(
+        'updatemgr',
+        $nodename,
+        'root@pam',
+        sub { PVE::UpdateManager::Job::run_all($targets, $settings->{timeout}, $opts) },
+        1,    # background
+    );
+};
+if (my $err = $@) {
+    syslog('err', "unable to start the scheduled update: $err");
+    exit 1;
 }
+syslog('info', "started $upid");
 
 # With $background set, fork_worker returns as soon as the worker exists. Waiting
 # here would hold the timer's oneshot service open for the length of a
-# dist-upgrade - and, in the parallel branch, would have made it serial.
+# dist-upgrade.
 exit 0;

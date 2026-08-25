@@ -103,16 +103,39 @@ jobs:
       run: |
         set -euo pipefail
         bash packaging/build-deb.sh 0.0.0-ci
+
+        # Read once into a variable, then matched with a here-string. NOT
+        # `dpkg-deb --contents ... | grep -q ...`: grep -q exits the moment it
+        # matches, dpkg-deb takes SIGPIPE for it and exits 141, and `pipefail`
+        # turns that into a failed pipeline - a FATAL for a file that is in the
+        # package. It is a race, and it was won for as long as this check has
+        # existed because the UI file sorted LAST in the listing, so dpkg-deb had
+        # nothing left to write when grep exited. It went off on the first commit
+        # that installed something after it. tests/run-tests.sh carries the same
+        # note about `grep -m1 | head -1` for the same reason.
+        contents="$(dpkg-deb --contents deb-out/*.deb)"
+
         # A package that installs the UI file anywhere but the directory pveproxy
         # serves as /pve2/js/ would install fine and then do nothing.
-        dpkg-deb --contents deb-out/*.deb \
-          | grep -q './usr/share/pve-manager/js/pve-update-manager.js' \
+        grep -qF './usr/share/pve-manager/js/pve-update-manager.js' <<< "$contents" \
           || { echo "FATAL: the UI file is not where pveproxy serves it from"; exit 1; }
-        # The maintainer scripts and the trigger are what re-apply the hooks
-        # after a pve-manager upgrade - a package without them dies at the next
-        # apt run.
+
+        # The text of the failure notification, in the one directory Proxmox
+        # renders notification templates from. A package without it sends a
+        # notification that fails to render at the moment it is needed.
+        for part in subject.txt body.txt body.html; do
+          grep -qF "./usr/share/pve-manager/templates/default/pve-update-manager-$part.hbs" \
+            <<< "$contents" \
+            || { echo "FATAL: the $part notification template is not in the package"; exit 1; }
+        done
+
+        # The maintainer scripts and the trigger are what re-apply the hooks after
+        # a pve-manager upgrade - a package without them is a package that dies at
+        # the next apt run. `tar -t` reads its input to the end, so this pipe has
+        # nothing to take SIGPIPE for; the grep below is off the pipe either way.
+        members="$(dpkg-deb --ctrl-tarfile deb-out/*.deb | tar -t)"
         for f in postinst prerm postrm triggers; do
-          dpkg-deb --ctrl-tarfile deb-out/*.deb | tar -t | grep -q "^./$f$" \
+          grep -qxF "./$f" <<< "$members" \
             || { echo "FATAL: $f missing from the package"; exit 1; }
         done
         # Architecture: all is what makes one artifact serve every port of

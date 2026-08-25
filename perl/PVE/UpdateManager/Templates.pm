@@ -296,7 +296,11 @@ sub load {
     my $file = templates_file();
     return (defaults(), 0) if !-f $file;
 
-    my $raw = eval { PVE::Tools::file_get_contents($file, $MAX_FILE_SIZE) };
+    my $raw = eval {
+        PVE::UpdateManager::Config::from_utf8(
+            PVE::Tools::file_get_contents($file, $MAX_FILE_SIZE),
+        );
+    };
     if (my $err = $@) {
         chomp($err);
         warn "pve-update-manager: cannot read the update templates: $err\n";
@@ -343,7 +347,10 @@ sub save {
             if length($script) > $PVE::UpdateManager::Config::MAX_SCRIPT_SIZE;
     }
 
-    my $raw = encode($templates);
+    # Bytes from here on: the file is UTF-8, and a name or a script that came in
+    # as characters would otherwise be written as Latin-1 for everything below
+    # U+0100 - see the note on from_utf8/to_utf8.
+    my $raw = PVE::UpdateManager::Config::to_utf8(encode($templates));
     die "the template list is too large (max $MAX_FILE_SIZE bytes)\n"
         if length($raw) > $MAX_FILE_SIZE;
 

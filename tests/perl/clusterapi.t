@@ -11,7 +11,7 @@ use strict;
 use warnings;
 
 use File::Temp qw(tempdir);
-use Test::More tests => 35;
+use Test::More tests => 40;
 
 use PVE::API2::Cluster;
 use PVE::RESTHandler;
@@ -29,6 +29,7 @@ my $get_templates = PVE::RESTHandler::registered('PVE::UpdateManager::ClusterAPI
 my $set_template = PVE::RESTHandler::registered('PVE::UpdateManager::ClusterAPI', 'set_template');
 my $del_template = PVE::RESTHandler::registered('PVE::UpdateManager::ClusterAPI', 'delete_template');
 my $reset_templates = PVE::RESTHandler::registered('PVE::UpdateManager::ClusterAPI', 'reset_templates');
+my $targets = PVE::RESTHandler::registered('PVE::UpdateManager::ClusterAPI', 'targets');
 
 @PVE::API2::Cluster::RESOURCES = (
     { type => 'node', node => 'pve-b' },
@@ -121,6 +122,61 @@ my $reset_templates = PVE::RESTHandler::registered('PVE::UpdateManager::ClusterA
     $res = $get_settings->({});
     is($res->{uniform}, 0, 'a node that differs is reported, which is what the warning is for');
     is($res->{timeout}, 4444, 'and the prefill stays the first node, so a reload does not wander');
+}
+
+# ── the list shows a node only to somebody who may audit it ─────────────────
+#
+# PVE's own resource index does NOT drop a node the user may not audit - it
+# returns every one of them and only leaves the statistics out. Everything this
+# addon puts on a node row - whether commands are stored, how the last run went,
+# the task id to open its log - is ours, and the node tab asks for Sys.Audit
+# before showing any of it. The datacenter tab has to ask the same thing.
+{
+    local @PVE::API2::Cluster::RESOURCES = (
+        { type => 'node', node => 'pve-a', status => 'online' },
+        { type => 'node', node => 'pve-b', status => 'online' },
+        { type => 'lxc', vmid => 101, node => 'pve-a', name => 'db', status => 'running' },
+    );
+
+    my $all = $targets->({});
+    is_deeply(
+        [map { "$_->{type}:$_->{id}" } @$all],
+        ['node:pve-a', 'node:pve-b', 'lxc:101'],
+        'with every privilege: both nodes and the container',
+    );
+
+    local $PVE::RPCEnvironment::CHECK = sub {
+        my ($path) = @_;
+        return $path ne '/nodes/pve-b';
+    };
+
+    my $some = $targets->({});
+    is_deeply(
+        [map { "$_->{type}:$_->{id}" } @$some],
+        ['node:pve-a', 'lxc:101'],
+        'a node the user may not audit is not on the list at all',
+    );
+}
+
+# The same for the settings a datacenter-wide save would show: they are read off
+# the nodes, and a node nobody may audit must not answer through this either.
+{
+    local @PVE::API2::Cluster::RESOURCES = (
+        { type => 'node', node => 'pve-a' },
+        { type => 'node', node => 'pve-b' },
+    );
+    PVE::UpdateManager::Config::save_settings('pve-a', { timeout => 7777 });
+    PVE::UpdateManager::Config::save_settings('pve-b', { timeout => 8888 });
+
+    local $PVE::RPCEnvironment::CHECK = sub {
+        my ($path) = @_;
+        return $path ne '/nodes/pve-b';
+    };
+
+    my $res = $get_settings->({});
+    is($res->{nodes}, 1, 'only the nodes the user may look at are counted');
+    is($res->{timeout}, 7777, 'and the prefill comes from one of those');
+    is($res->{uniform}, 1, 'a node it cannot see cannot make them disagree either');
 }
 
 # A cluster of one still works - and it is the common case.

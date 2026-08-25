@@ -51,7 +51,9 @@ __PACKAGE__->register_method({
             { name => 'script' },
             { name => 'targets' },
             { name => 'run' },
+            { name => 'logs' },
             { name => 'settings' },
+            { name => 'order' },
         ];
     },
 });
@@ -215,12 +217,25 @@ __PACKAGE__->register_method({
                 status => { type => 'string' },
                 stored => { type => 'boolean', description => "An update script is stored for this target." },
                 template => { type => 'boolean', optional => 1 },
+                order => {
+                    type => 'integer',
+                    description => "Where this target sits in a run. Lower goes first, 0"
+                        . " means no answer given and goes last. In a parallel run everything"
+                        . " sharing a number starts at once and the next number waits for it.",
+                },
                 parallel_manual => {
                     type => 'boolean',
                     optional => 1,
                     description => "Node rows only: whether manual runs on this node start"
                         . " all targets at once. The grids read it from here so a run"
                         . " honours the setting of the node that owns the target.",
+                },
+                snapshot_shutdown => {
+                    type => 'boolean',
+                    optional => 1,
+                    description => "Node rows only: whether a container on this node is shut"
+                        . " down for its snapshot. The confirmation dialog says so out loud,"
+                        . " because it is downtime nobody asked for at the moment of clicking.",
                 },
                 %{ PVE::UpdateManager::Config::last_run_schema() },
             },
@@ -239,14 +254,17 @@ __PACKAGE__->register_method({
         # unticked - Proxmox has its own updater for the node and this row is the
         # exception, not the default.
         if ($rpcenv->check($authuser, "/nodes/$node", ['Sys.Audit'], 1)) {
+            my $settings = PVE::UpdateManager::Config::load_settings($node);
             push @$res, {
                 type => 'node',
                 id => $node,
                 name => $node,
                 status => 'online',
                 stored => PVE::UpdateManager::Config::has_script('node', $node) ? 1 : 0,
-                parallel_manual =>
-                    PVE::UpdateManager::Config::load_settings($node)->{parallel_manual} ? 1 : 0,
+                order => PVE::UpdateManager::Config::load_order('node', $node),
+                parallel_manual => $settings->{parallel_manual} ? 1 : 0,
+                snapshot_shutdown =>
+                    ($settings->{snapshot_before} && $settings->{snapshot_shutdown}) ? 1 : 0,
                 %{ PVE::UpdateManager::Config::last_run('node', $node) },
             };
         }
@@ -266,6 +284,7 @@ __PACKAGE__->register_method({
                 status => $running ? 'running' : 'stopped',
                 template => $conf->{template} ? 1 : 0,
                 stored => PVE::UpdateManager::Config::has_script('lxc', $vmid) ? 1 : 0,
+                order => PVE::UpdateManager::Config::load_order('lxc', $vmid),
                 %{ PVE::UpdateManager::Config::last_run('lxc', $vmid) },
             };
         }
@@ -341,7 +360,127 @@ __PACKAGE__->register_method({
     code => sub {
         my ($param) = @_;
 
-        PVE::UpdateManager::Config::save_script('node', $param->{node}, $param->{script});
+        my $rpcenv = PVE::RPCEnvironment::get();
+
+        PVE::UpdateManager::Config::save_script(
+            'node', $param->{node}, $param->{script}, $rpcenv->get_user(),
+        );
+
+        return undef;
+    },
+});
+
+# ── the previous versions of that script ────────────────────────────────────
+#
+# The same pair of endpoints the container tab has, for the host's own script.
+
+__PACKAGE__->register_method({
+    name => 'script_versions',
+    path => 'script/versions',
+    method => 'GET',
+    protected => 1,
+    proxyto => 'node',
+    description => "List the saved versions of the host's update script, newest first.",
+    permissions => {
+        check => ['perm', '/nodes/{node}', ['Sys.Audit']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+        },
+    },
+    returns => {
+        type => 'array',
+        items => {
+            type => 'object',
+            properties => {
+                # The shape and the reasoning are the container endpoint's -
+                # see PVE::UpdateManager::LXCAPI.
+                version => { type => 'string', maxLength => 32 },
+                time => { type => 'integer' },
+                user => { type => 'string', optional => 1 },
+                size => { type => 'integer' },
+            },
+        },
+    },
+    code => sub {
+        my ($param) = @_;
+
+        return PVE::UpdateManager::Config::list_versions('node', $param->{node});
+    },
+});
+
+__PACKAGE__->register_method({
+    name => 'script_version',
+    path => 'script/versions/{version}',
+    method => 'GET',
+    protected => 1,
+    proxyto => 'node',
+    description => "The text of one saved version of the host's update script.",
+    permissions => {
+        check => ['perm', '/nodes/{node}', ['Sys.Audit']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            version => {
+                type => 'string',
+                # Exactly the two shapes version_file() accepts - see the
+                # container endpoint for why there are two.
+                pattern => '[0-9]{4}(-[0-9]{2}){5}|[0-9]{1,12}',
+                maxLength => 32,
+            },
+        },
+    },
+    returns => {
+        type => 'object',
+        properties => {
+            script => { type => 'string' },
+        },
+    },
+    code => sub {
+        my ($param) = @_;
+
+        my $script =
+            PVE::UpdateManager::Config::load_version('node', $param->{node}, $param->{version});
+
+        raise_param_exc({ version => "no such version" }) if !defined($script);
+
+        return { script => $script };
+    },
+});
+
+__PACKAGE__->register_method({
+    name => 'set_order',
+    path => 'order',
+    method => 'PUT',
+    protected => 1,
+    proxyto => 'node',
+    description => "Set the position of this host in a serial update run.",
+    permissions => {
+        check => ['perm', '/nodes/{node}', ['Sys.Modify']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            order => {
+                type => 'integer',
+                minimum => 0,
+                maximum => $PVE::UpdateManager::Config::MAX_ORDER,
+                description => "Lower goes first. 0 means no answer given, and that goes"
+                    . " after everything that has one - which is where the host row would"
+                    . " otherwise sit anyway, since a run only ever includes it on purpose.",
+            },
+        },
+    },
+    returns => { type => 'null' },
+    code => sub {
+        my ($param) = @_;
+
+        PVE::UpdateManager::Config::save_order('node', $param->{node}, $param->{order});
 
         return undef;
     },
@@ -370,6 +509,84 @@ __PACKAGE__->register_method({
         PVE::UpdateManager::Config::delete_script('node', $param->{node});
 
         return undef;
+    },
+});
+
+__PACKAGE__->register_method({
+    name => 'logs',
+    path => 'logs',
+    method => 'GET',
+    protected => 1,
+    proxyto => 'node',
+    description => "List the kept logs of the host's own past runs, newest first. The shape"
+        . " and the reasoning are the container endpoint's - see"
+        . " PVE::UpdateManager::LXCAPI.",
+    permissions => {
+        check => ['perm', '/nodes/{node}', ['Sys.Audit']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+        },
+    },
+    returns => {
+        type => 'array',
+        items => {
+            type => 'object',
+            properties => {
+                # The shape and the reasoning are the container endpoint's.
+                log => { type => 'string', maxLength => 32 },
+                time => { type => 'integer' },
+                size => { type => 'integer' },
+                state => { type => 'string', optional => 1, enum => ['ok', 'failed', 'skipped'] },
+                note => { type => 'string', optional => 1 },
+                upid => { type => 'string', optional => 1 },
+            },
+        },
+    },
+    code => sub {
+        my ($param) = @_;
+
+        return PVE::UpdateManager::Config::list_logs('node', $param->{node});
+    },
+});
+
+__PACKAGE__->register_method({
+    name => 'log',
+    path => 'logs/{log}',
+    method => 'GET',
+    protected => 1,
+    proxyto => 'node',
+    description => "The text of one kept run log of the host itself.",
+    permissions => {
+        check => ['perm', '/nodes/{node}', ['Sys.Audit']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            log => {
+                type => 'string',
+                pattern => '[0-9]{4}(-[0-9]{2}){5}',
+                maxLength => 32,
+            },
+        },
+    },
+    returns => {
+        type => 'object',
+        properties => {
+            log => { type => 'string' },
+        },
+    },
+    code => sub {
+        my ($param) = @_;
+
+        my $text = PVE::UpdateManager::Config::load_log('node', $param->{node}, $param->{log});
+
+        raise_param_exc({ log => "no such run log" }) if !defined($text);
+
+        return { log => $text };
     },
 });
 
@@ -425,7 +642,14 @@ __PACKAGE__->register_method({
         # move it.
         my $settings = PVE::UpdateManager::Config::load_settings($node);
         my $timeout = $param->{timeout} // $settings->{timeout};
-        my $opts = PVE::UpdateManager::Config::run_opts($settings);
+        # The node's own switch decides whether the selection is walked one at a
+        # time or a position at a time - not the caller. It used to be the caller:
+        # the web interface sent one request per target for a parallel run, which
+        # is why the update order did nothing there and why nothing knew when the
+        # whole run was over.
+        my $opts = PVE::UpdateManager::Config::run_opts(
+            $settings, $settings->{parallel_manual},
+        );
 
         my $targets = [];
 

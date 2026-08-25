@@ -65,9 +65,20 @@ __PACKAGE__->register_method({
 # filesystem everywhere, so one write reaches them all. Sending twelve HTTP
 # requests to twelve nodes would only add twelve ways to half-succeed.
 
-# Every node this user is allowed to see, from the same index the sidebar tree
-# is built from.
-my $visible_nodes = sub {
+# Every node of the cluster, from the same index the sidebar tree is built from.
+#
+# NOT filtered by what the user may see, and that is not an oversight in PVE:
+# `resources` skips a guest the user has no VM.Audit on, but it returns every
+# node and only leaves the statistics out of the ones it may not report. Read on
+# a real PVE 9.2, not recalled - the node branch has no `next`, it passes
+# !$can_audit into extract_node_stats and pushes the entry either way.
+#
+# So anything that reads a node's settings off this list has to do the check
+# itself. `audited_nodes` below is that list; this one is only for the
+# datacenter-wide save, which writes to every node there is and refuses unless
+# the user holds Sys.Console on ALL of them - filtering that one would turn a
+# refusal into a save that silently skipped the nodes it could not see.
+my $all_nodes = sub {
     my $resources = PVE::API2::Cluster->resources({});
 
     return [
@@ -75,6 +86,17 @@ my $visible_nodes = sub {
         map { $_->{node} }
         grep { ($_->{type} // '') eq 'node' && defined($_->{node}) }
         @$resources
+    ];
+};
+
+# The nodes this user may actually look at.
+my $audited_nodes = sub {
+    my $rpcenv = PVE::RPCEnvironment::get();
+    my $authuser = $rpcenv->get_user();
+
+    return [
+        grep { $rpcenv->check($authuser, "/nodes/$_", ['Sys.Audit'], 1) }
+        @{ $all_nodes->() }
     ];
 };
 
@@ -111,7 +133,7 @@ __PACKAGE__->register_method({
         },
     },
     code => sub {
-        my $nodes = $visible_nodes->();
+        my $nodes = $audited_nodes->();
 
         my $keys = [sort keys %{ PVE::UpdateManager::Config::global_settings_schema() }];
 
@@ -168,7 +190,7 @@ __PACKAGE__->register_method({
         my $rpcenv = PVE::RPCEnvironment::get();
         my $authuser = $rpcenv->get_user();
 
-        my $nodes = $visible_nodes->();
+        my $nodes = $all_nodes->();
 
         die "no node to write to\n" if !scalar(@$nodes);
 
@@ -381,6 +403,11 @@ __PACKAGE__->register_method({
                 status => { type => 'string' },
                 template => { type => 'boolean', optional => 1 },
                 stored => { type => 'boolean', description => "An update script is stored for this target." },
+                order => {
+                    type => 'integer',
+                    description => "Where this target sits in a run. Lower goes first,"
+                        . " 0 means no answer given and goes last.",
+                },
                 parallel_manual => {
                     type => 'boolean',
                     optional => 1,
@@ -388,17 +415,28 @@ __PACKAGE__->register_method({
                         . " targets at once. A datacenter-wide run honours each node's own"
                         . " setting for the targets that node owns.",
                 },
+                snapshot_shutdown => {
+                    type => 'boolean',
+                    optional => 1,
+                    description => "Node rows only: whether a container on that node is shut"
+                        . " down for its snapshot.",
+                },
                 %{ PVE::UpdateManager::Config::last_run_schema() },
             },
         },
     },
     code => sub {
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $authuser = $rpcenv->get_user();
+
         # The cluster resource index is where the web interface itself gets its
-        # tree from: every node and guest, with live status, already filtered by
-        # what this user may see. Rebuilding that from /etc/pve would mean
-        # guessing at the status of a guest on another node - this way the list
-        # is exactly the one the user already sees in the sidebar, with our own
-        # columns added.
+        # tree from: every node and guest, with live status. Rebuilding that from
+        # /etc/pve would mean guessing at the status of a guest on another node -
+        # this way the list is the one the user already sees in the sidebar, with
+        # our own columns added.
+        #
+        # It filters GUESTS by VM.Audit and nodes not at all, so the node rows
+        # are filtered below and the guest rows are taken as they come.
         my $resources = PVE::API2::Cluster->resources({});
 
         my $nodes = [];
@@ -409,6 +447,15 @@ __PACKAGE__->register_method({
 
             if ($type eq 'node') {
                 my $node = $r->{node};
+                # `resources` hands back every node whatever the user may see -
+                # see the comment on $all_nodes - so the row that names this
+                # node's stored commands, its last run and its task id is
+                # filtered here. Without it the datacenter tab showed all of
+                # that to anybody with a single container, while the node tab
+                # asked for Sys.Audit for the very same row.
+                next if !$rpcenv->check($authuser, "/nodes/$node", ['Sys.Audit'], 1);
+
+                my $settings = PVE::UpdateManager::Config::load_settings($node);
                 push @$nodes, {
                     type => 'node',
                     id => $node,
@@ -416,8 +463,10 @@ __PACKAGE__->register_method({
                     name => $node,
                     status => $r->{status} // 'unknown',
                     stored => PVE::UpdateManager::Config::has_script('node', $node) ? 1 : 0,
-                    parallel_manual =>
-                        PVE::UpdateManager::Config::load_settings($node)->{parallel_manual} ? 1 : 0,
+                    order => PVE::UpdateManager::Config::load_order('node', $node),
+                    parallel_manual => $settings->{parallel_manual} ? 1 : 0,
+                    snapshot_shutdown =>
+                        ($settings->{snapshot_before} && $settings->{snapshot_shutdown}) ? 1 : 0,
                     %{ PVE::UpdateManager::Config::last_run('node', $node) },
                 };
             } elsif ($type eq 'lxc') {
@@ -431,6 +480,7 @@ __PACKAGE__->register_method({
                     status => $r->{status} // 'unknown',
                     template => $r->{template} ? 1 : 0,
                     stored => PVE::UpdateManager::Config::has_script('lxc', $vmid) ? 1 : 0,
+                    order => PVE::UpdateManager::Config::load_order('lxc', $vmid),
                     %{ PVE::UpdateManager::Config::last_run('lxc', $vmid) },
                 };
             }

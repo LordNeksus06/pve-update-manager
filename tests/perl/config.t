@@ -9,7 +9,7 @@ use strict;
 use warnings;
 
 use File::Temp qw(tempdir);
-use Test::More tests => 33;
+use Test::More tests => 43;
 
 use PVE::Tools;
 use PVE::UpdateManager::Config;
@@ -133,5 +133,67 @@ is(PVE::UpdateManager::Config::delete_script('lxc', 101), 0, 'deleting again is 
         $script,
         "echo a\nprintf 'b\\r'\n",
         'an escape sequence a script writes itself is left alone - only CRLF pairs go',
+    );
+}
+
+# ── the files are UTF-8, and everything above this speaks characters ────────
+#
+# Both directions were wrong, and both were measured on a real 9.2. Returning
+# bytes made PVE's REST layer encode them a second time - an emoji came back as
+# four characters. Writing characters made Perl emit Latin-1 for anything below
+# U+0100, so a script with nothing but umlauts was stored as fc f6 e4 rather
+# than c3 bc c3 b6 c3 a4. Together they ate a script one save at a time.
+{
+    my $text = "echo \"EMOJI: \x{1F4E6} UMLAUTE: \x{fc}\x{f6}\x{e4}\"\n";
+
+    PVE::UpdateManager::Config::save_script('lxc', 501, $text);
+
+    # What is on disk has to be UTF-8, whatever the string was made of.
+    open(my $fh, '<:raw', "$dir/store/lxc-501.conf") or die "cannot read it back - $!";
+    my $raw = do { local $/; <$fh> };
+    close($fh);
+
+    like($raw, qr/\xf0\x9f\x93\xa6/, 'an emoji is stored as UTF-8');
+    like($raw, qr/\xc3\xbc\xc3\xb6\xc3\xa4/, 'and so are umlauts, which is where Latin-1 crept in');
+    unlike($raw, qr/\xfc\xf6\xe4/, 'never as the single Latin-1 bytes');
+
+    # And what comes back has to be the same CHARACTERS, not the bytes: handing
+    # bytes to the API is what got them encoded twice.
+    my ($back) = PVE::UpdateManager::Config::load_script('lxc', 501);
+    is($back, $text, 'it reads back as the same characters');
+    ok(utf8::is_utf8($back), 'decoded, so the REST layer will not encode it again');
+
+    # The round trip has to be stable - this is the loop that ate the script.
+    PVE::UpdateManager::Config::save_script('lxc', 501, $back);
+    my ($twice) = PVE::UpdateManager::Config::load_script('lxc', 501);
+    is($twice, $text, 'saving what was read changes nothing, however often it happens');
+}
+
+# A file this addon wrote before that was fixed is Latin-1. It is read back the
+# way it was written rather than as a row of replacement characters, and the
+# next save rewrites it properly.
+{
+    PVE::Tools::file_set_contents("$dir/store/lxc-502.conf", "echo \"\xfc\xf6\xe4\"\n");
+
+    my ($back) = PVE::UpdateManager::Config::load_script('lxc', 502);
+    is($back, "echo \"\x{fc}\x{f6}\x{e4}\"\n", 'a Latin-1 file from before the fix still reads');
+    unlike($back, qr/\x{fffd}/, 'and not as replacement characters');
+
+    PVE::UpdateManager::Config::save_script('lxc', 502, $back);
+    open(my $fh, '<:raw', "$dir/store/lxc-502.conf") or die $!;
+    my $raw = do { local $/; <$fh> };
+    close($fh);
+    like($raw, qr/\xc3\xbc/, 'and the next save writes it as UTF-8');
+}
+
+# The size limit is pmxcfs', so it counts bytes - a script of umlauts is longer
+# as bytes than as characters, and the check has to know that.
+{
+    my $chars = int($PVE::UpdateManager::Config::MAX_SCRIPT_SIZE * 0.6);
+    my $script = "\x{fc}" x $chars;    # 2 bytes each - over the limit, under it in characters
+
+    ok(
+        !defined(eval { PVE::UpdateManager::Config::save_script('lxc', 503, $script); 1 }),
+        'a script that only exceeds the limit once encoded is refused',
     );
 }
