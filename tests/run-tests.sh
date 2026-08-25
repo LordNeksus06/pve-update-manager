@@ -62,7 +62,28 @@ line_of() {
     grep -nEm1 -- "$pattern" "$file" 2>/dev/null | cut -d: -f1 || true
 }
 
+# A test that drives a run has to say where its cgroup is.
+#
+# PVE::UpdateManager::Job moves its worker out of the control group of the daemon
+# that forked it, and the runner reads /proc/self/cgroup to find out whether it
+# has to. On a developer's machine that is a login session's .scope and nothing
+# happens; on a CI runner it can be a .service, and then every run starts with a
+# busctl call that lands in RUN_CALLS ahead of the first pct - which is how this
+# was found, green here and red on the other forge's runner.
+#
+# So each test that touches Job points CGROUP_FILE at a file that does not exist.
+# Checked rather than remembered: the two tests that needed it did not have it,
+# and the next one to be written would not have it either.
 echo "== perl unit tests"
+for t in tests/perl/*.t; do
+    grep -q 'UpdateManager::Job' "$t" || continue
+    if grep -q 'UpdateManager::Runner::CGROUP_FILE' "$t"; then
+        ok "$t pins the cgroup it reads, so a run does not try to leave one"
+    else
+        bad "$t drives a run without setting \$PVE::UpdateManager::Runner::CGROUP_FILE"
+    fi
+done
+
 for t in tests/perl/*.t; do
     if out="$(perl -I tests/stubs -I perl "$t" 2>&1)"; then
         ok "$t"

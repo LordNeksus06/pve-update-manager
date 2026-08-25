@@ -17,11 +17,21 @@ use PVE::Tools;
 use PVE::RESTHandler;
 use PVE::RPCEnvironment;
 use PVE::UpdateManager::Config;
+use PVE::UpdateManager::Runner;
 use PVE::UpdateManager::Job;
 use PVE::UpdateManager::LXCAPI;
 
 my $dir = tempdir(CLEANUP => 1);
 $PVE::UpdateManager::Config::BASE_DIR = "$dir/store";
+
+# A run moves its worker out of the control group of the daemon that forked it,
+# which is a real busctl call and would land in RUN_CALLS as the first command of
+# every run. Pointed at a file that does not exist, the runner cannot tell where
+# it is and skips the move. Not optional dressing: the test machine decides
+# otherwise, and a CI runner that happens to sit inside a .service made every
+# "the first thing pct did" claim in here fail. run-tests.sh checks that each
+# test touching Job sets this.
+$PVE::UpdateManager::Runner::CGROUP_FILE = "$dir/no-such-cgroup";
 
 my $run = PVE::RESTHandler::registered('PVE::UpdateManager::LXCAPI', 'run');
 ok(ref($run) eq 'CODE', 'the run endpoint is registered');

@@ -23,6 +23,15 @@ use PVE::UpdateManager::Runner;
 my $dir = tempdir(CLEANUP => 1);
 $PVE::UpdateManager::Config::BASE_DIR = "$dir/store";
 
+# A run moves its worker out of the control group of the daemon that forked it,
+# which is a real busctl call and would land in RUN_CALLS as the first command of
+# every run. Pointed at a file that does not exist, the runner cannot tell where
+# it is and skips the move. Not optional dressing: the test machine decides
+# otherwise, and a CI runner that happens to sit inside a .service made every
+# "the first thing pct did" claim in here fail. run-tests.sh checks that each
+# test touching Job sets this.
+$PVE::UpdateManager::Runner::CGROUP_FILE = "$dir/no-such-cgroup";
+
 # Same trick job.t uses: a worker writes with print, because inside a Proxmox
 # worker STDOUT is the task log.
 sub capture {
