@@ -18,11 +18,11 @@ use strict;
 use warnings;
 
 use PVE::INotify;
-use PVE::LXC::Config;
 use PVE::RPCEnvironment;
 use PVE::SafeSyslog;
 
 use PVE::UpdateManager::Config;
+use PVE::UpdateManager::Guest;
 use PVE::UpdateManager::Job;
 
 initlog('pve-update-manager-schedule');
@@ -40,7 +40,9 @@ my $settings = PVE::UpdateManager::Config::load_settings($nodename);
 # The same options a manual run gets, from the same function, so an unattended
 # run cannot quietly behave differently from the one the operator tried by hand.
 # The scheduled parallel switch is its own, and this is where it is answered.
-my $opts = PVE::UpdateManager::Config::run_opts($settings, $settings->{schedule_parallel});
+my $opts = PVE::UpdateManager::Config::run_opts(
+    $settings, $settings->{schedule_parallel}, $settings->{schedule_parallel_max},
+);
 
 # Everything the schedule points at, in the order the manual runs use.
 sub collect_targets {
@@ -50,8 +52,7 @@ sub collect_targets {
         if $settings->{schedule_host};
 
     for my $vmid (grep { length } split(/,/, $settings->{schedule_vmids} // '')) {
-        my $name = eval { PVE::LXC::Config->load_config($vmid)->{hostname} };
-        push @$targets, { type => 'lxc', id => $vmid, name => $name };
+        push @$targets, PVE::UpdateManager::Guest::target($vmid);
     }
 
     return $targets;
@@ -63,7 +64,11 @@ if ($cmd eq 'status') {
     print "node:     $nodename\n";
     print "enabled:  " . ($settings->{schedule_enabled} ? 'yes' : 'no') . "\n";
     print "schedule: $settings->{schedule_time}\n";
-    print "mode:     " . ($settings->{schedule_parallel} ? 'parallel' : 'serial') . "\n";
+    my $mode = !$settings->{schedule_parallel} ? 'serial'
+        : $settings->{schedule_parallel_max}
+        ? "parallel, at most $settings->{schedule_parallel_max} at once"
+        : 'parallel';
+    print "mode:     $mode\n";
     print "host:     " . ($settings->{schedule_host} ? 'yes' : 'no') . "\n";
     print "vmids:    "
         . ($settings->{schedule_vmids} eq '' ? '-' : $settings->{schedule_vmids}) . "\n";

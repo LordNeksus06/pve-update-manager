@@ -46,6 +46,7 @@ PVE.updmgr.MAX_ORDER = 99999;
 if (typeof Proxmox !== 'undefined' && Proxmox.Utils && Proxmox.Utils.override_task_descriptions) {
     Proxmox.Utils.override_task_descriptions({
         ctupdate: ['CT', PVE.updmgr.TAB_TITLE],
+        vmupdate: ['VM', PVE.updmgr.TAB_TITLE],
         updatemgr: ['Node', PVE.updmgr.TAB_TITLE],
     });
 }
@@ -172,11 +173,24 @@ PVE.updmgr.templateMenuButton = function (apply) {
 
 // ── Shared helpers ──────────────────────────────────────────────────────────
 
+// A guest is a container ('lxc') or a VM ('qemu') - Proxmox' own type names,
+// which are also the path segment of its API: /nodes/<node>/lxc/<vmid> and
+// /nodes/<node>/qemu/<vmid>. Anything that is not 'qemu' is a container, which is
+// what every row was before VMs existed here.
+PVE.updmgr.guestPath = function (data) {
+    return data.type === 'qemu' ? 'qemu' : 'lxc';
+};
+
+// 'CT' / 'VM', as the Proxmox interface itself abbreviates them.
+PVE.updmgr.guestLabel = function (data) {
+    return data.type === 'qemu' ? 'VM' : 'CT';
+};
+
 PVE.updmgr.targetLabel = function (data) {
     if (data.type === 'node') {
         return `Host ${data.name}`;
     }
-    return `CT ${data.vmid} (${data.name})`;
+    return `${PVE.updmgr.guestLabel(data)} ${data.vmid} (${data.name})`;
 };
 
 // Where a target's commands live. A datacenter selection spans nodes, so the
@@ -190,7 +204,7 @@ PVE.updmgr.scriptUrlFor = function (data, defaultNode) {
 
     return data.type === 'node'
         ? `/nodes/${node}/updatemgr/script`
-        : `/nodes/${node}/lxc/${data.vmid}/updatemgr/script`;
+        : `/nodes/${node}/${PVE.updmgr.guestPath(data)}/${data.vmid}/updatemgr/script`;
 };
 
 // Where a target's position in a run is written. Same shape as
@@ -203,7 +217,7 @@ PVE.updmgr.orderUrlFor = function (data, defaultNode) {
 
     return data.type === 'node'
         ? `/nodes/${node}/updatemgr/order`
-        : `/nodes/${node}/lxc/${data.vmid}/updatemgr/order`;
+        : `/nodes/${node}/${PVE.updmgr.guestPath(data)}/${data.vmid}/updatemgr/order`;
 };
 
 // Where a target's kept run logs live. Same shape as orderUrlFor and for the same
@@ -218,7 +232,7 @@ PVE.updmgr.logsUrlFor = function (data, defaultNode) {
 
     return data.type === 'node'
         ? `/nodes/${node}/updatemgr/logs`
-        : `/nodes/${node}/lxc/${data.vmid}/updatemgr/logs`;
+        : `/nodes/${node}/${PVE.updmgr.guestPath(data)}/${data.vmid}/updatemgr/logs`;
 };
 
 // What the operator typed into the order prompt, as the API wants it.
@@ -571,14 +585,14 @@ PVE.updmgr.showLog = function (upid) {
     Ext.create('Proxmox.window.TaskViewer', { upid: upid }).show();
 };
 
-// The endpoint that runs exactly one CONTAINER, and the task type it produces:
-// `ctupdate` with the vmid as its id, so the task list says "CT 102 - Update
-// Manager" instead of labelling it as a job on the node.
+// The endpoint that runs exactly one GUEST, and the task type it produces:
+// `ctupdate` or `vmupdate` with the vmid as its id, so the task list says "CT 102
+// - Update Manager" instead of labelling it as a job on the node.
 //
-// Containers only. The host has no endpoint of its own - updating it is the node
+// Guests only. The host has no endpoint of its own - updating it is the node
 // endpoint with host=1 - and a branch here for a case nothing reaches would only
 // suggest there was one. dispatch() is the single caller and it calls this for
-// one container on its own; everything else goes to the node.
+// one guest on its own; everything else goes to the node.
 PVE.updmgr.runUrlFor = function (data, defaultNode) {
     let node = data.node || defaultNode;
     if (!node || data.type === 'node') {
@@ -586,7 +600,7 @@ PVE.updmgr.runUrlFor = function (data, defaultNode) {
     }
 
     return {
-        url: `/nodes/${node}/lxc/${data.vmid}/updatemgr/run`,
+        url: `/nodes/${node}/${PVE.updmgr.guestPath(data)}/${data.vmid}/updatemgr/run`,
         params: {},
         node: node,
         label: PVE.updmgr.targetLabel(data),
@@ -629,8 +643,9 @@ PVE.updmgr.dispatch = function (targets, defaultNode, callback) {
             byNode[node].host = 1;
         } else {
             byNode[node].vmids.push(data.vmid);
-            // Kept for the one-container case below, which needs the record and
-            // not just the vmid.
+            // Kept for the one-guest case below, which needs the record and
+            // not just the vmid. Containers and VMs share the vmids list: a vmid
+            // is unique across both, and the node tells them apart itself.
             byNode[node].single = data;
         }
     });
@@ -639,8 +654,8 @@ PVE.updmgr.dispatch = function (targets, defaultNode, callback) {
         let group = byNode[node];
 
         if (!group.host && group.vmids.length === 1) {
-            // One container on its own goes to its own endpoint. Same work
-            // either way, but the task is then typed `ctupdate` with the vmid as
+            // One guest on its own goes to its own endpoint. Same work
+            // either way, but the task is then typed `ctupdate`/`vmupdate` with the vmid as
             // its id, so the task list says "CT 102 - Update Manager" instead of
             // labelling it as a job on the node - indistinguishable from
             // updating the host itself.
@@ -1154,10 +1169,15 @@ Ext.define('PVE.updmgr.ScriptPanel', {
     },
 });
 
-// ── Container tab ───────────────────────────────────────────────────────────
+// ── Container and VM tab ────────────────────────────────────────────────────
+//
+// One panel for both kinds: `guestType` is 'lxc' or 'qemu' and picks the API
+// path and the label, and nothing else about the tab differs.
 Ext.define('PVE.updmgr.LxcPanel', {
     extend: 'PVE.updmgr.ScriptPanel',
     alias: 'widget.pveUpdMgrLxc',
+
+    guestType: 'lxc',
 
     initComponent: function () {
         let me = this;
@@ -1169,10 +1189,14 @@ Ext.define('PVE.updmgr.LxcPanel', {
             throw 'no vmid specified';
         }
 
+        let data = { type: me.guestType };
+        let path = PVE.updmgr.guestPath(data);
+        let label = PVE.updmgr.guestLabel(data);
+
         Ext.apply(me, {
-            scriptUrl: `/nodes/${me.nodename}/lxc/${me.vmid}/updatemgr/script`,
-            runUrl: `/nodes/${me.nodename}/lxc/${me.vmid}/updatemgr/run`,
-            targetLabel: me.guestName ? `CT ${me.vmid} (${me.guestName})` : `CT ${me.vmid}`,
+            scriptUrl: `/nodes/${me.nodename}/${path}/${me.vmid}/updatemgr/script`,
+            runUrl: `/nodes/${me.nodename}/${path}/${me.vmid}/updatemgr/run`,
+            targetLabel: me.guestName ? `${label} ${me.vmid} (${me.guestName})` : `${label} ${me.vmid}`,
         });
 
         me.callParent();
@@ -2164,8 +2188,8 @@ Ext.define('PVE.updmgr.TargetGrid', {
             });
         } else {
             win = Ext.create('PVE.updmgr.ScriptWindow', {
-                scriptUrl: `/nodes/${node}/lxc/${rec.data.vmid}/updatemgr/script`,
-                runUrl: `/nodes/${node}/lxc/${rec.data.vmid}/updatemgr/run`,
+                scriptUrl: PVE.updmgr.scriptUrlFor(rec.data, node),
+                runUrl: PVE.updmgr.runUrlFor(rec.data, node).url,
                 targetLabel: PVE.updmgr.targetLabel(rec.data),
                 canRun: me.canRunGuest,
                 canEdit: me.canEditGuest,
@@ -2513,7 +2537,11 @@ Ext.define('PVE.updmgr.TargetGrid', {
                     if (value === 'node') {
                         return `<i class="fa fa-fw fa-server"></i> ${gettext('Host')}`;
                     }
-                    return `<i class="fa fa-fw fa-cube"></i> ${rec.data.template ? gettext('Template') : 'CT'}`;
+                    // The icons of the resource tree: a cube for a container, a
+                    // desktop for a VM.
+                    let icon = value === 'qemu' ? 'fa-desktop' : 'fa-cube';
+                    let text = rec.data.template ? gettext('Template') : PVE.updmgr.guestLabel(rec.data);
+                    return `<i class="fa fa-fw ${icon}"></i> ${text}`;
                 },
             },
             // No renderer on these three, and that is not an oversight: an id is
@@ -2845,12 +2873,19 @@ Ext.define('PVE.updmgr.SettingsWindow', {
                 let data = response.result.data;
 
                 me.down('#parallelManual').setValue(!!data.parallel_manual);
+                // Blank for 0: the field's empty text says "no limit".
+                me.down('#parallelManualMax').setValue(data.parallel_manual_max || null);
                 me.down('#timeout').setValue(Math.round((data.timeout || 14400) / 60));
                 me.down('#startStopped').setValue(!!data.start_stopped);
                 me.down('#snapshotBefore').setValue(!!data.snapshot_before);
                 me.down('#snapshotKeep').setValue(data.snapshot_keep || 3);
                 me.down('#snapshotShutdown').setValue(!!data.snapshot_shutdown);
                 me.down('#rollbackOnFailure').setValue(!!data.rollback_on_failure);
+                // No `|| 1`: this one defaults to on, so a falsy-or-default would
+                // show a tick where the server said untick and save it back that way.
+                me.down('#rollbackRemoveNewer').setValue(
+                    data.rollback_remove_newer === undefined ? true : !!data.rollback_remove_newer,
+                );
                 me.down('#notifyFailure').setValue(!!data.notify_failure);
                 me.down('#scriptVersions').setValue(data.script_versions || 3);
                 // Not `|| 3`: 0 is a real answer here - keep no run logs - and a
@@ -2870,6 +2905,7 @@ Ext.define('PVE.updmgr.SettingsWindow', {
                 me.down('#scheduleEnabled').setValue(!!data.schedule_enabled);
                 me.down('#scheduleTime').setValue(data.schedule_time);
                 me.down('#scheduleParallel').setValue(!!data.schedule_parallel);
+                me.down('#scheduleParallelMax').setValue(data.schedule_parallel_max || null);
 
                 if (me.global) {
                     me.down('#scheduleHost').setValue(!!data.schedule_host);
@@ -2908,11 +2944,11 @@ Ext.define('PVE.updmgr.SettingsWindow', {
         let me = this;
 
         let text = Ext.String.format(
-            gettext('Saving writes these settings to all {0} nodes.'),
+            gettext('Saving applies to all {0} nodes.'),
             data.nodes,
         );
         if (!data.uniform) {
-            text += ` ${gettext('They do not all have the same settings today.')}`;
+            text += ` ${gettext('Their current settings differ.')}`;
         }
         me.down('#nextrun').setText(text);
     },
@@ -2939,18 +2975,21 @@ Ext.define('PVE.updmgr.SettingsWindow', {
 
         return {
             parallel_manual: me.down('#parallelManual').getValue() ? 1 : 0,
+            parallel_manual_max: me.down('#parallelManualMax').getValue() || 0,
             timeout: me.down('#timeout').getValue() * 60,
             start_stopped: me.down('#startStopped').getValue() ? 1 : 0,
             snapshot_before: me.down('#snapshotBefore').getValue() ? 1 : 0,
             snapshot_keep: me.down('#snapshotKeep').getValue(),
             snapshot_shutdown: me.down('#snapshotShutdown').getValue() ? 1 : 0,
             rollback_on_failure: me.down('#rollbackOnFailure').getValue() ? 1 : 0,
+            rollback_remove_newer: me.down('#rollbackRemoveNewer').getValue() ? 1 : 0,
             notify_failure: me.down('#notifyFailure').getValue() ? 1 : 0,
             script_versions: me.down('#scriptVersions').getValue(),
             run_logs: me.down('#runLogs').getValue(),
             schedule_enabled: me.down('#scheduleEnabled').getValue() ? 1 : 0,
             schedule_time: me.down('#scheduleTime').getValue(),
             schedule_parallel: me.down('#scheduleParallel').getValue() ? 1 : 0,
+            schedule_parallel_max: me.down('#scheduleParallelMax').getValue() || 0,
         };
     },
 
@@ -2994,10 +3033,8 @@ Ext.define('PVE.updmgr.SettingsWindow', {
             gettext('Confirm'),
             Ext.String.format(
                 gettext(
-                    'Overwrite the Update Manager settings of all {0} nodes with what is'
-                        + ' shown here? Each node keeps its own selection of scheduled'
-                        + ' containers; everything else on this page replaces what that node'
-                        + ' has today.',
+                    'Overwrite the settings of all {0} nodes? Each node keeps its scheduled'
+                        + ' containers.',
                 ),
                 me.nodeCount,
             ),
@@ -3024,6 +3061,45 @@ Ext.define('PVE.updmgr.SettingsWindow', {
                 me.close();
             },
         });
+    },
+
+    // A parallel switch and, right beside it, how many targets it may start at
+    // once. One helper for both rows, because a manual run and a scheduled one
+    // must offer the same thing in the same place. The number is greyed out
+    // while its switch is off: it means nothing for a serial run.
+    parallelRow: function (switchId, maxId) {
+        let me = this;
+
+        return {
+            xtype: 'fieldcontainer',
+            layout: 'hbox',
+            margin: '0 0 8 0',
+            items: [
+                {
+                    xtype: 'checkbox',
+                    itemId: switchId,
+                    boxLabel: gettext('Update in parallel'),
+                    width: 200,
+                    listeners: {
+                        change: function (box, value) {
+                            me.down(`#${maxId}`).setDisabled(!value);
+                        },
+                    },
+                },
+                {
+                    xtype: 'proxmoxintegerfield',
+                    itemId: maxId,
+                    fieldLabel: gettext('Max. at once'),
+                    labelWidth: 90,
+                    width: 200,
+                    minValue: 1,
+                    maxValue: 100,
+                    allowBlank: true,
+                    emptyText: gettext('no limit'),
+                    disabled: true,
+                },
+            ],
+        };
     },
 
     initComponent: function () {
@@ -3053,7 +3129,7 @@ Ext.define('PVE.updmgr.SettingsWindow', {
             // it.
             height: 260,
             border: true,
-            title: gettext('Run these targets on the schedule'),
+            title: gettext('Scheduled targets'),
             selModel: { type: 'checkboxmodel', mode: 'SIMPLE', checkOnly: true },
             store: Ext.create('Ext.data.Store', {
                 fields: ['type', 'id', 'name', 'status', { name: 'vmid', type: 'int' },
@@ -3103,45 +3179,35 @@ Ext.define('PVE.updmgr.SettingsWindow', {
 
         Ext.apply(me, {
             title: me.global
-                ? gettext('Update Manager settings for all nodes')
-                : Ext.String.format(gettext('Update Manager settings for {0}'), me.nodename),
+                ? gettext('Update Manager Settings: All Nodes')
+                : Ext.String.format(gettext('Update Manager Settings: {0}'), me.nodename),
             items: [
                 {
                     xtype: 'panel',
                     layout: { type: 'vbox', align: 'stretch' },
                     bodyPadding: 10,
                     scrollable: 'y',
+                    defaults: { margin: '0 0 10 0' },
                     items: [
-                        // Said before the fields rather than only in the
-                        // confirmation: somebody who opens this window to look
-                        // at a value should know what pressing Save would do
-                        // before they start changing things.
+                        // Before the fields, not only in the confirmation: whoever
+                        // opens this to look at a value should know what Save does.
                         me.global
                             ? {
                                   xtype: 'displayfield',
                                   userCls: 'pmx-hint',
-                                  margin: '0 0 10 0',
-                                  value: gettext(
-                                      'These settings are written to EVERY node and replace'
-                                          + ' what each of them has. A node has no way to keep'
-                                          + ' its own answer to any of them.',
-                                  ),
+                                  value: gettext('Saving overwrites these settings on every node.'),
                               }
-                            : { xtype: 'container', height: 0 },
+                            : { xtype: 'container', height: 0, margin: 0 },
                         {
                             xtype: 'fieldset',
-                            title: gettext('Limits'),
-                            margin: '0 0 10 0',
+                            title: gettext('General'),
                             items: [
                                 {
-                                    // In minutes, because the useful values here
-                                    // are hours and nobody should have to count
-                                    // zeros to say "four hours". The API still
-                                    // speaks seconds and still accepts finer
-                                    // values than this field offers.
+                                    // Minutes, because the useful values are hours.
+                                    // The API speaks seconds.
                                     xtype: 'proxmoxintegerfield',
                                     itemId: 'timeout',
-                                    fieldLabel: gettext('Kill a run after'),
+                                    fieldLabel: gettext('Timeout (minutes)'),
                                     labelWidth: 160,
                                     minValue: 1,
                                     maxValue: 1440,
@@ -3149,61 +3215,45 @@ Ext.define('PVE.updmgr.SettingsWindow', {
                                     emptyText: '240',
                                 },
                                 {
-                                    xtype: 'displayfield',
-                                    userCls: 'faded',
-                                    value: gettext(
-                                        'Minutes. This kills the update and everything it started,'
-                                            + ' so keep it well above the longest upgrade you expect'
-                                            + ' - a package manager cut off mid-install has to be'
-                                            + ' repaired by hand.',
-                                    ),
+                                    xtype: 'checkbox',
+                                    itemId: 'startStopped',
+                                    boxLabel: gettext('Start stopped containers for the update, then stop them'),
+                                },
+                                {
+                                    // No address field: delivery is configured once,
+                                    // under Datacenter -> Notifications.
+                                    xtype: 'checkbox',
+                                    itemId: 'notifyFailure',
+                                    boxLabel: gettext('Send a notification when a target fails'),
                                 },
                             ],
                         },
                         {
                             xtype: 'fieldset',
-                            title: gettext('Stopped containers'),
-                            margin: '0 0 10 0',
+                            title: gettext('Manual Runs'),
                             items: [
-                                {
-                                    xtype: 'checkbox',
-                                    itemId: 'startStopped',
-                                    boxLabel: gettext(
-                                        'Start a stopped container for its update, then stop it again',
-                                    ),
-                                },
-                                {
-                                    xtype: 'displayfield',
-                                    userCls: 'faded',
-                                    value: gettext(
-                                        'Off by default: a stopped container is skipped. With this on'
-                                            + ' it is started, updated and shut down again, ending up'
-                                            + ' the way it was found - but its services and cron run'
-                                            + ' for as long as the update takes.',
-                                    ),
-                                },
+                                // Its own switch, not shared with the schedule: a
+                                // click is somebody watching, the timer is not.
+                                me.parallelRow('parallelManual', 'parallelManualMax'),
                             ],
                         },
                         {
                             xtype: 'fieldset',
                             itemId: 'snapshots',
                             title: gettext('Snapshots'),
-                            margin: '0 0 10 0',
-                            // Shown only where a container on this node could
-                            // actually be snapshotted - see the load() above.
+                            // Shown only where a container on this node can be
+                            // snapshotted - see load().
                             hidden: true,
                             items: [
                                 {
                                     xtype: 'checkbox',
                                     itemId: 'snapshotBefore',
-                                    boxLabel: gettext(
-                                        'Take a snapshot of a container before updating it',
-                                    ),
+                                    boxLabel: gettext('Take a snapshot before each update'),
                                 },
                                 {
                                     xtype: 'proxmoxintegerfield',
                                     itemId: 'snapshotKeep',
-                                    fieldLabel: gettext('Keep the last'),
+                                    fieldLabel: gettext('Snapshots to keep'),
                                     labelWidth: 160,
                                     minValue: 1,
                                     maxValue: 100,
@@ -3211,100 +3261,40 @@ Ext.define('PVE.updmgr.SettingsWindow', {
                                     emptyText: '3',
                                 },
                                 {
-                                    xtype: 'displayfield',
-                                    userCls: 'faded',
-                                    value: gettext(
-                                        'On by default: it is what makes a bad upgrade undoable.'
-                                            + ' Only snapshots taken by the Update Manager are ever'
-                                            + ' removed - one somebody made by hand is left alone.'
-                                            + ' A container whose storage cannot snapshot is updated'
-                                            + ' without one, and the run says so in its log.',
-                                    ),
-                                },
-                                {
                                     xtype: 'checkbox',
                                     itemId: 'rollbackOnFailure',
-                                    margin: '8 0 0 0',
-                                    boxLabel: gettext(
-                                        'Roll the container back to that snapshot when the update fails',
-                                    ),
+                                    boxLabel: gettext('Roll back when the update fails'),
                                 },
                                 {
+                                    // Kept as text, not a tooltip: this is the one
+                                    // switch here that throws data away.
                                     xtype: 'displayfield',
                                     userCls: 'faded',
-                                    value: gettext(
-                                        'Off by default, and not a small switch: a rollback throws'
-                                            + ' away everything that happened since the snapshot, not'
-                                            + ' only what the update did - anything a service wrote in'
-                                            + ' the meantime goes with it. The container is stopped for'
-                                            + ' the rollback and started again if it was running.',
-                                    ),
+                                    value: gettext('Discards every change since the snapshot, not only the update.'),
                                 },
                                 {
+                                    xtype: 'checkbox',
+                                    itemId: 'rollbackRemoveNewer',
+                                    boxLabel: gettext('Remove newer snapshots that block the rollback'),
+                                },
+                                {
+                                    // A container snapshot holds no memory, so a
+                                    // running one is caught as if the power had
+                                    // been pulled.
                                     xtype: 'checkbox',
                                     itemId: 'snapshotShutdown',
-                                    margin: '8 0 0 0',
-                                    boxLabel: gettext(
-                                        'Shut the container down for the snapshot, then start it again',
-                                    ),
-                                },
-                                {
-                                    xtype: 'displayfield',
-                                    userCls: 'faded',
-                                    value: gettext(
-                                        'Off by default. A container snapshot never holds memory -'
-                                            + ' that exists for VMs only - so a running container is'
-                                            + ' caught as if the power had been pulled, and a database'
-                                            + ' mid-transaction is caught mid-transaction. Stopping it'
-                                            + ' first is the only way to a consistent snapshot, and it'
-                                            + ' costs the downtime of a shutdown and a start. A'
-                                            + ' container that was already stopped is untouched.',
-                                    ),
+                                    boxLabel: gettext('Shut down the container for a consistent snapshot'),
                                 },
                             ],
                         },
                         {
                             xtype: 'fieldset',
-                            title: gettext('Notifications'),
-                            margin: '0 0 10 0',
-                            items: [
-                                {
-                                    xtype: 'checkbox',
-                                    itemId: 'notifyFailure',
-                                    boxLabel: gettext(
-                                        'Send a notification when a run had a target fail',
-                                    ),
-                                },
-                                {
-                                    xtype: 'displayfield',
-                                    userCls: 'faded',
-                                    // No address field here on purpose: this
-                                    // goes out through Proxmox' own notification
-                                    // system, so where it lands is already
-                                    // configured once, for every job on the
-                                    // node, under Datacenter -> Notifications.
-                                    value: gettext(
-                                        'On by default. One notification per run, once the whole'
-                                            + ' run is over, listing the targets that failed with'
-                                            + ' their exit code and the time they finished. It goes'
-                                            + ' wherever this node already sends its backup and'
-                                            + ' package notifications - Datacenter → Notifications'
-                                            + ' decides that. Nothing is sent for a run in which'
-                                            + ' everything worked, and a target that was skipped is'
-                                            + ' not a failure.',
-                                    ),
-                                },
-                            ],
-                        },
-                        {
-                            xtype: 'fieldset',
-                            title: gettext('Update commands'),
-                            margin: '0 0 10 0',
+                            title: gettext('Retention'),
                             items: [
                                 {
                                     xtype: 'proxmoxintegerfield',
                                     itemId: 'scriptVersions',
-                                    fieldLabel: gettext('Keep the last'),
+                                    fieldLabel: gettext('Script versions'),
                                     labelWidth: 160,
                                     minValue: 1,
                                     maxValue: 50,
@@ -3312,140 +3302,56 @@ Ext.define('PVE.updmgr.SettingsWindow', {
                                     emptyText: '3',
                                 },
                                 {
-                                    xtype: 'displayfield',
-                                    userCls: 'faded',
-                                    value: gettext(
-                                        'Saved versions of each target\'s commands, reachable from'
-                                            + ' the History button in the editor. Every save that'
-                                            + ' changes something writes one, and the newest is what'
-                                            + ' is stored now - so 3 means the current text and the'
-                                            + ' two before it.',
-                                    ),
-                                },
-                                {
+                                    // Kept on the node rather than in /etc/pve,
+                                    // where a file may not exceed 1 MiB.
                                     xtype: 'proxmoxintegerfield',
                                     itemId: 'runLogs',
-                                    fieldLabel: gettext('Keep run logs'),
+                                    fieldLabel: gettext('Run logs'),
                                     labelWidth: 160,
-                                    margin: '8 0 0 0',
                                     minValue: 0,
                                     maxValue: 50,
                                     allowBlank: false,
                                     emptyText: '3',
-                                },
-                                {
-                                    xtype: 'displayfield',
-                                    userCls: 'faded',
-                                    value: gettext(
-                                        'Logs of past runs, per target, reachable from the Run'
-                                            + ' Logs button in the editor. 0 keeps none. They are'
-                                            + ' kept on the node that ran them rather than in'
-                                            + ' /etc/pve, where a file may not exceed 1 MiB - one'
-                                            + ' target may write up to 8 MiB to a log. Proxmox has'
-                                            + ' its own task log, but its entry falls out of the'
-                                            + ' task index after a few thousand tasks and the Last'
-                                            + ' Log button then finds nothing; this copy is pruned'
-                                            + ' on purpose instead.',
-                                    ),
-                                },
-                            ],
-                        },
-                        {
-                            xtype: 'fieldset',
-                            title: gettext('Manual runs'),
-                            margin: '0 0 10 0',
-                            items: [
-                                {
-                                    xtype: 'checkbox',
-                                    itemId: 'parallelManual',
-                                    // Its own switch, deliberately not shared with
-                                    // the schedule: pressing Update Selected is
-                                    // somebody watching who wants everything
-                                    // moving now, while the timer firing at 03:00
-                                    // is unattended.
-                                    //
-                                    // "targets" rather than "containers": a host
-                                    // row can be ticked too, and the label would
-                                    // then be describing something it does not do.
-                                    boxLabel: gettext('Update all targets in parallel'),
-                                },
-                                {
-                                    xtype: 'displayfield',
-                                    userCls: 'faded',
-                                    value: gettext(
-                                        'The update order still applies: targets sharing a'
-                                            + ' position start at once, and the next position'
-                                            + ' does not start until the last of them is done.'
-                                            + ' Targets with no position set are one final group.',
-                                    ),
                                 },
                             ],
                         },
                         {
                             xtype: 'fieldset',
                             title: gettext('Schedule'),
+                            margin: 0,
                             layout: { type: 'vbox', align: 'stretch' },
                             items: [
                                 {
                                     xtype: 'checkbox',
                                     itemId: 'scheduleEnabled',
-                                    margin: '0 0 8 0',
-                                    boxLabel: gettext('Run on a schedule'),
+                                    boxLabel: gettext('Enabled'),
                                 },
                                 {
-                                    // The same field and the same syntax a backup
-                                    // job uses, so "at 03:00" is expressible and
-                                    // already familiar: 03:00, mon..fri 02:30,
-                                    // */8:00.
+                                    // The field and syntax of a backup job:
+                                    // 03:00, mon..fri 02:30, */8:00.
                                     xtype: 'pveCalendarEvent',
                                     itemId: 'scheduleTime',
                                     name: 'schedule_time',
                                     fieldLabel: gettext('Schedule'),
-                                    labelWidth: 90,
+                                    labelWidth: 160,
                                     margin: '0 0 8 0',
                                     value: '03:00',
                                 },
-                                {
-                                    xtype: 'checkbox',
-                                    itemId: 'scheduleParallel',
-                                    margin: '0 0 8 0',
-                                    boxLabel: gettext('Update all targets in parallel'),
-                                },
-                                {
-                                    xtype: 'displayfield',
-                                    userCls: 'faded',
-                                    margin: '0 0 8 0',
-                                    value: gettext(
-                                        'By position, exactly as a manual parallel run - and in'
-                                            + ' one task, so the notification at the end speaks'
-                                            + ' for the whole run.',
-                                    ),
-                                },
-                                // Which containers a schedule runs is the one
-                                // answer that cannot be given for the whole
-                                // cluster - a vmid lives on exactly one node.
-                                // So global mode gets the host tick as a plain
-                                // checkbox and says where the rest is decided.
+                                me.parallelRow('scheduleParallel', 'scheduleParallelMax'),
+                                // A vmid lives on one node, so global mode offers
+                                // only the host tick and says where the rest is.
                                 me.global
                                     ? {
                                           xtype: 'checkbox',
                                           itemId: 'scheduleHost',
-                                          margin: '0 0 8 0',
-                                          boxLabel: gettext(
-                                              "Include each node's own update script",
-                                          ),
+                                          boxLabel: gettext('Include the host'),
                                       }
                                     : me.targetGrid,
                                 me.global
                                     ? {
                                           xtype: 'displayfield',
                                           userCls: 'faded',
-                                          value: gettext(
-                                              'Which containers a node updates on its'
-                                                  + ' schedule stays that node\'s own setting -'
-                                                  + ' a container exists on one node only. Set it'
-                                                  + ' under Node → Update Manager → Settings.',
-                                          ),
+                                          value: gettext('Containers are selected per node.'),
                                       }
                                     : { xtype: 'container', height: 0 },
                             ],
@@ -3549,13 +3455,16 @@ Ext.define('PVE.updmgr.DcPanel', {
 // ── Hooking the tabs in ─────────────────────────────────────────────────────
 //
 // PVE.panel.Config.initComponent is the injection point: PVE.lxc.Config,
-// PVE.node.Config and PVE.dc.Config have finished filling me.items by the time
-// they call up into it, and it has not yet been consumed. $className tells them
-// apart, so one override serves all three without touching any of them.
+// PVE.qemu.Config, PVE.node.Config and PVE.dc.Config have finished filling
+// me.items by the time they call up into it, and it has not yet been consumed.
+// $className tells them apart, so one override serves all four without touching
+// any of them.
 PVE.updmgr.injectTab = function (panel) {
     let cls = panel.$className;
 
-    if (cls !== 'PVE.lxc.Config' && cls !== 'PVE.node.Config' && cls !== 'PVE.dc.Config') {
+    let guestType = { 'PVE.lxc.Config': 'lxc', 'PVE.qemu.Config': 'qemu' }[cls];
+
+    if (!guestType && cls !== 'PVE.node.Config' && cls !== 'PVE.dc.Config') {
         return;
     }
     if (!Ext.isArray(panel.items)) {
@@ -3568,7 +3477,7 @@ PVE.updmgr.injectTab = function (panel) {
     let caps = Ext.state.Manager.get('GuiCap') || {};
     let item;
 
-    if (cls === 'PVE.lxc.Config') {
+    if (guestType) {
         let vm = panel.pveSelNode.data;
 
         // A template is never running, so there is nothing to exec into.
@@ -3581,6 +3490,7 @@ PVE.updmgr.injectTab = function (panel) {
 
         item = {
             xtype: 'pveUpdMgrLxc',
+            guestType: guestType,
             nodename: vm.node,
             vmid: vm.vmid,
             guestName: vm.name,
@@ -3614,17 +3524,17 @@ PVE.updmgr.injectTab = function (panel) {
     panel.items.splice(idx >= 0 ? idx + 1 : panel.items.length, 0, item);
 };
 
-// ── Throwing the stored commands away with the container ────────────────────
+// ── Throwing the stored commands away with the guest ────────────────────────
 //
-// A destroyed container leaves everything it had in /etc/pve behind: its
+// A destroyed container or VM leaves everything it had in /etc/pve behind: its
 // commands, the saved versions of them, its place in a run and its
 // last-run record. That is not only clutter - Proxmox hands vmids out again, so
-// the next container created as 101 would inherit all of it without anybody
+// the next guest created as 101 would inherit all of it without anybody
 // having typed a line.
 //
 // So the destroy dialog gets one more tick, on by default, and it is a tick
 // rather than an automatism because the files are also a legitimate thing to
-// keep: rebuilding a container under the same id and wanting its script back is
+// keep: rebuilding a guest under the same id and wanting its script back is
 // a real workflow.
 //
 // The dialog itself is Proxmox' PVE.window.SafeDestroyGuest. Nothing of it is
@@ -3635,19 +3545,19 @@ PVE.updmgr.STORAGE_CHECKBOX = 'pveUpdMgrDropStored';
 // Where to send the cleanup, given the URL the destroy dialog was built with.
 //
 // Read back from the dialog rather than passed in, because this override has no
-// say in how the window was created - and matched strictly, because the same
-// window destroys VMs from `/nodes/<node>/qemu/<vmid>`, which has nothing stored
-// here and must produce no request at all.
+// say in how the window was created - and matched strictly: the same window is
+// used for other things than guests, and anything that is not exactly a
+// container's or a VM's own URL must produce no request at all.
 PVE.updmgr.destroyCleanupUrl = function (url) {
-    let match = String(url || '').match(/^\/nodes\/([^/]+)\/lxc\/(\d+)$/);
+    let match = String(url || '').match(/^\/nodes\/([^/]+)\/(lxc|qemu)\/(\d+)$/);
     if (!match) {
         return undefined;
     }
 
     // purge: the last-run record, the saved versions and the order go too.
-    // Keeping any of them would hand a container's update history to whatever is
+    // Keeping any of them would hand a guest's update history to whatever is
     // created with that vmid next.
-    return `/nodes/${match[1]}/lxc/${match[2]}/updatemgr/script?purge=1`;
+    return `/nodes/${match[1]}/${match[2]}/${match[3]}/updatemgr/script?purge=1`;
 };
 
 Ext.define('PVE.updmgr.SafeDestroyGuestOverride', {
@@ -3661,9 +3571,12 @@ Ext.define('PVE.updmgr.SafeDestroyGuestOverride', {
         // in the tab costs a tab, a throw in THIS costs the ability to delete a
         // guest at all, which is Proxmox' function and not ours to break.
         try {
-            // Containers only. A VM has no update script here, and a tick
-            // offering to delete something that cannot exist is worse than none.
-            if ((me.getItem() || {}).type === 'CT') {
+            // Containers and VMs - Proxmox' dialog calls them 'CT' and 'VM'
+            // (read off pvemanagerlib.js, PVE 9.2). Anything else it destroys
+            // has no update script here, and a tick offering to delete
+            // something that cannot exist is worse than none.
+            let kind = (me.getItem() || {}).type;
+            if (kind === 'CT' || kind === 'VM') {
                 // concat, not push: additionalItems is on the prototype and is
                 // shared by every dialog this class ever opens. Pushing would
                 // add a checkbox per destroyed container, for ever.
@@ -3677,10 +3590,10 @@ Ext.define('PVE.updmgr.SafeDestroyGuestOverride', {
                         autoEl: {
                             tag: 'div',
                             'data-qtip': gettext(
-                                'Removes this container from the Update Manager: its commands,'
+                                'Removes this guest from the Update Manager: its commands,'
                                     + ' their saved versions, its place in a run and its'
                                     + ' last-run record. Without this they stay, and a new'
-                                    + ' container created with the same ID would inherit them.',
+                                    + ' guest created with the same ID would inherit them.',
                             ),
                         },
                     },

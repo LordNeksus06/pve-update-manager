@@ -32,7 +32,9 @@ use PVE::LXC;
 use PVE::LXC::Config;
 
 use PVE::UpdateManager::Config;
+use PVE::UpdateManager::Guest;
 use PVE::UpdateManager::Notify;
+use PVE::UpdateManager::QemuRunner;
 use PVE::UpdateManager::Runner;
 
 # A worker's STDOUT is the task log file itself - fork_worker points it there
@@ -177,8 +179,11 @@ sub _describe {
         return "Host $target->{id}";
     }
 
+    my $label = PVE::UpdateManager::Guest::label($target->{type});
     my $name = $target->{name};
-    return defined($name) && length($name) ? "CT $target->{id} ($name)" : "CT $target->{id}";
+    return defined($name) && length($name)
+        ? "$label $target->{id} ($name)"
+        : "$label $target->{id}";
 }
 
 # The same target, short enough to sit in front of every line of its output.
@@ -188,7 +193,9 @@ sub _describe {
 sub _short_desc {
     my ($target) = @_;
 
-    return $target->{type} eq 'node' ? "Host $target->{id}" : "CT $target->{id}";
+    return $target->{type} eq 'node'
+        ? "Host $target->{id}"
+        : PVE::UpdateManager::Guest::label($target->{type}) . " $target->{id}";
 }
 
 # The worker's own UPID, so a row can link to the log of the run that set its
@@ -351,12 +358,16 @@ sub run_one {
     # because the container is running perfectly well somewhere else. On a
     # schedule that is the same misleading line every night, and starting it -
     # which is what the note invites - fails for a reason that names no cause.
-    my $conf = $target->{type} eq 'lxc'
-        ? eval { PVE::LXC::Config->load_config($target->{id}) }
+    my $guest = PVE::UpdateManager::Guest::is_guest_type($target->{type});
+    my $vm = $target->{type} eq 'qemu';
+    my $noun = PVE::UpdateManager::Guest::noun($target->{type});
+
+    my $conf = $guest
+        ? eval { PVE::UpdateManager::Guest::load_config($target->{type}, $target->{id}) }
         : undef;
 
-    if ($target->{type} eq 'lxc' && !$conf) {
-        my $note = 'not a container on this node';
+    if ($guest && !$conf) {
+        my $note = "not a $noun on this node";
         _set_state(
             $target,
             {
@@ -374,8 +385,8 @@ sub run_one {
     # the selection came out as a FAILED target rather than as one there was
     # never anything to do for. Select All picks them up, which is how it gets
     # into a run in the first place.
-    if ($conf && PVE::LXC::Config->is_template($conf)) {
-        my $note = 'this is a template, not a container';
+    if ($conf && PVE::UpdateManager::Guest::is_template($target->{type}, $conf)) {
+        my $note = "this is a template, not a $noun";
         _set_state(
             $target,
             {
@@ -390,17 +401,50 @@ sub run_one {
     # somebody deliberately stopped runs its services and its cron for as long
     # as the update takes, which is not a decision an update tool gets to make
     # on its own. The node's settings are where it can be granted.
-    my $stopped = $target->{type} eq 'lxc' && !PVE::LXC::check_running($target->{id});
+    my $stopped = $guest && !PVE::UpdateManager::Guest::is_running($target->{type}, $target->{id});
 
-    if ($stopped && !$opts->{start_stopped}) {
+    # Starting a stopped VM is not built yet - it needs a boot, a wait for the
+    # guest agent and a shutdown that PVE does differently for VMs - so a VM
+    # that is off is skipped whatever the setting says, and the row says why
+    # rather than pretending the setting was not on.
+    if ($stopped && (!$opts->{start_stopped} || $vm)) {
+        my $note = "$noun is not running";
+        $note .= " - starting stopped VMs for their update is not supported yet"
+            if $vm && $opts->{start_stopped};
         _set_state(
             $target,
             {
                 state => 'skipped', upid => $upid, started => $started,
-                finished => time(), note => 'container is not running',
+                finished => time(), note => $note,
             },
         );
-        return (undef, 'container is not running', $stop->(undef, 'container is not running'));
+        return (undef, $note, $stop->(undef, $note));
+    }
+
+    # A VM is reached through its guest agent and nothing else. Without one the
+    # update did not happen, and that is a FAILURE, not a skip - the owner's
+    # call: a VM that silently never gets updated is the outcome to avoid, and a
+    # skip sends no notification.
+    #
+    # Asked before the row is claimed, so a VM without an agent does not flash
+    # a spinner for the three seconds the ping takes.
+    if ($vm) {
+        my $missing = !PVE::UpdateManager::Guest::agent_enabled($conf)
+            ? 'the QEMU guest agent is not enabled in the options of this VM'
+            : !PVE::UpdateManager::QemuRunner::agent_running($target->{id})
+            ? 'the QEMU guest agent is not answering - is qemu-guest-agent running inside the VM?'
+            : undef;
+
+        if (defined($missing)) {
+            _set_state(
+                $target,
+                {
+                    state => 'failed', upid => $upid, started => $started,
+                    finished => time(), exit => -1, note => $missing,
+                },
+            );
+            return (-1, $missing, $stop->(-1, $missing));
+        }
     }
 
     # Written before the run, not after: this is what makes the grid show a
@@ -461,15 +505,19 @@ sub run_one {
     #
     # A check-then-act, deliberately. lock_guest stays the real guard; this only
     # keeps the common case from paying for a snapshot nobody can use.
-    my $foreign_lock = $target->{type} eq 'lxc'
-        ? eval { PVE::LXC::Config->load_config($target->{id})->{lock} }
+    #
+    # A VM is asked too: a backup or a migration holds its config lock the same
+    # way, and running apt inside a VM that is being migrated away is the same
+    # mistake. Only the repairs below are container business.
+    my $foreign_lock = $guest
+        ? eval { PVE::UpdateManager::Guest::load_config($target->{type}, $target->{id})->{lock} }
         : undef;
 
     # A 'snapshot-delete' lock nobody has touched for ten minutes is not another
     # task holding the container, it is the wreck of an earlier run of ours -
     # and skipping it means skipping this container for good. Repaired here so
     # the next update is what un-sticks it, rather than a manual `pct unlock`.
-    if (defined($foreign_lock)
+    if (!$vm && defined($foreign_lock)
         && $foreign_lock eq $PVE::UpdateManager::Runner::SNAPSHOT_DELETE_LOCK) {
 
         my $wedged = PVE::UpdateManager::Runner::stale_delete_wedge($target->{id});
@@ -492,7 +540,7 @@ sub run_one {
             . int($PVE::UpdateManager::Runner::STALE_WEDGE_SECONDS / 60)
             . " minutes, so this may be left over from an update that was"
             . " interrupted; 'pct unlock $target->{id}' clears it"
-            if PVE::UpdateManager::Runner::stale_own_lock($target->{id});
+            if !$vm && PVE::UpdateManager::Runner::stale_own_lock($target->{id});
 
         _set_state(
             $target,
@@ -528,6 +576,12 @@ sub run_one {
             $logfunc,
         );
     };
+
+    # Snapshots of VMs are not built yet. Said in the log rather than refused:
+    # updating without one is what a container on a storage that cannot snapshot
+    # gets too, and a run that is refused for a missing feature updates nothing.
+    _log('snapshots of VMs are not supported yet - updating without one')
+        if $vm && $opts->{snapshot_before};
 
     if ($target->{type} eq 'lxc' && $opts->{snapshot_before}) {
         if (!PVE::UpdateManager::Runner::can_snapshot($target->{id})) {
@@ -630,12 +684,17 @@ sub run_one {
 
     # Proxmox refuses to stop, shut down, reboot or migrate a locked guest -
     # every one of those paths calls check_lock - so the lock is all it takes to
-    # keep a container from being switched off in the middle of its own
+    # keep a guest from being switched off in the middle of its own
     # dist-upgrade. Taken after the row is claimed, given back below whatever
-    # happens.
+    # happens. A container and a VM take different lock values - see
+    # Runner::LXC_LOCK and QemuRunner::VM_LOCK for why each is the one it is.
+    my ($lock_guest, $unlock_guest) = $vm
+        ? (\&PVE::UpdateManager::QemuRunner::lock_vm, \&PVE::UpdateManager::QemuRunner::unlock_vm)
+        : (\&PVE::UpdateManager::Runner::lock_guest, \&PVE::UpdateManager::Runner::unlock_guest);
+
     my $locked = 0;
-    if ($target->{type} eq 'lxc') {
-        if (eval { PVE::UpdateManager::Runner::lock_guest($target->{id}); 1 }) {
+    if ($guest) {
+        if (eval { $lock_guest->($target->{id}); 1 }) {
             $locked = 1;
         } else {
             # set_lock refuses rather than overwriting, so this is somebody
@@ -677,7 +736,7 @@ sub run_one {
             # turning the setting on, and it did not happen. The lock goes back
             # on the way out - an early return that keeps it would leave the
             # container unstoppable until somebody found `pct unlock`.
-            PVE::UpdateManager::Runner::unlock_guest($target->{id}, $logfunc) if $locked;
+            $unlock_guest->($target->{id}, $logfunc) if $locked;
             $prune->();
             return (
                             -1,
@@ -699,6 +758,8 @@ sub run_one {
     my $rc;
     if ($target->{type} eq 'node') {
         $rc = PVE::UpdateManager::Runner::run_host($script, $timeout, $logfunc);
+    } elsif ($vm) {
+        $rc = PVE::UpdateManager::QemuRunner::run_vm($target->{id}, $script, $timeout, $logfunc);
     } else {
         $rc = PVE::UpdateManager::Runner::run_lxc($target->{id}, $script, $timeout, $logfunc);
     }
@@ -707,7 +768,7 @@ sub run_one {
     # checks in vm_shutdown, so leaving it on would make our own attempt to put
     # the container back fail - the guard would defeat the thing it is guarding.
     # The update itself is over by this point, which is what the lock was for.
-    PVE::UpdateManager::Runner::unlock_guest($target->{id}, $logfunc) if $locked;
+    $unlock_guest->($target->{id}, $logfunc) if $locked;
 
     # ── undoing an update that failed ───────────────────────────────────────
     #
@@ -725,7 +786,9 @@ sub run_one {
         _log("the update failed - rolling the container back to $snapshot");
 
         if (eval {
-            PVE::UpdateManager::Runner::rollback_lxc($target->{id}, $snapshot, $logfunc);
+            PVE::UpdateManager::Runner::rollback_lxc(
+                $target->{id}, $snapshot, $logfunc, $opts->{rollback_remove_newer},
+            );
             1;
         }) {
             $rolled_back = 1;
@@ -973,13 +1036,17 @@ our $FORK = sub { return fork() };
 # at the end both need. So the wave runs inside this one task, and the target's
 # name goes in front of every line it writes.
 #
-# No cap on how many run at once. Forty containers ticked in parallel mode were
-# forty dist-upgrades at once before this existed too, and quietly holding some
-# of them back would be a limit nobody asked for hiding inside a feature about
-# ordering. The node's own settings are where that decision belongs if it is ever
-# wanted.
+# How many run at once is the node's setting (`parallel_max` in the run options,
+# 0 = no cap). Measured on a real node before the cap existed: 36 targets started
+# in the same second - the node's DNS and reverse-proxy containers among them -
+# and that night's failures were network fetches that went through when retried
+# one at a time. The cap does not change what a wave is: the next position still
+# waits for the last target of this one.
 sub _run_group {
     my ($group, $timeout, $upid, $opts) = @_;
+
+    my $max = $opts->{parallel_max} // 0;
+    $max = 0 if $max !~ m/\A\d+\z/;
 
     # Both halves matter. Setting $| flushes what this process has buffered right
     # now, so a child cannot inherit a half-written buffer and print it a second
@@ -993,6 +1060,8 @@ sub _run_group {
 
     for my $target (@$group) {
         my $desc = _describe($target);
+
+        _wait_for_slot(\@children, $max) if $max;
 
         my ($reader, $writer);
         if (!pipe($reader, $writer)) {
@@ -1124,8 +1193,13 @@ sub _run_group {
             next;
         }
 
-        waitpid($child->{pid}, 0);
-        my $status = $?;
+        # A child the cap already reaped has its status stored; a second
+        # waitpid on it would return -1 and lose it.
+        if (!$child->{reaped}) {
+            waitpid($child->{pid}, 0);
+            $child->{status} = $?;
+        }
+        my $status = $child->{status};
 
         my $raw = '';
         {
@@ -1183,6 +1257,39 @@ sub _run_group {
     }
 
     return \@results;
+}
+
+# Blocks until fewer than $max forked children of this wave are still running.
+#
+# Polled per child with WNOHANG rather than a blocking waitpid(-1): this process
+# has children that are not targets - the shutdown inhibitor is one, and
+# release_shutdown reaps it by pid - and reaping one of those here would take
+# its exit status from whoever is waiting for it. The status of a target's
+# child is kept on its record, because the collecting loop in _run_group must
+# not waitpid it a second time. Inline targets never count - they run later, in
+# this process, one at a time.
+our $SLOT_POLL = 0.2;
+
+sub _wait_for_slot {
+    my ($children, $max) = @_;
+
+    while (1) {
+        my $running = 0;
+        for my $child (@$children) {
+            next if !$child->{pid} || $child->{reaped};
+            # -1 is "no such child" and counts as gone: counted as running, it
+            # would keep this loop waiting for ever on a process that cannot end.
+            my $got = waitpid($child->{pid}, POSIX::WNOHANG());
+            if ($got == $child->{pid} || $got == -1) {
+                $child->{status} = $?;
+                $child->{reaped} = 1;
+                next;
+            }
+            $running++;
+        }
+        return if $running < $max;
+        select(undef, undef, undef, $SLOT_POLL);
+    }
 }
 
 sub run_all {
@@ -1256,9 +1363,11 @@ sub run_all {
 
         if ($opts->{parallel}) {
             _log('') if $wave > 1;
+            my $cap = $opts->{parallel_max} // 0;
             _log(
                 "=== position $wave of $waves: "
                     . join(', ', map { _describe($_) } @$group)
+                    . ($cap && $cap < scalar(@$group) ? ", at most $cap at once" : '')
                     . " ===",
             );
             push @results, @{ _run_group($group, $timeout, $upid, $opts) };

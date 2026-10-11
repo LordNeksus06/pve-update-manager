@@ -415,10 +415,15 @@ sub snapshot_lxc {
     return $name;
 }
 
-# Puts the container back to the snapshot this run took, and nothing else.
+# Puts the container back to the snapshot this run took.
 #
 # Only ever one of ours: rolling back to a snapshot somebody made by hand would
 # be this addon throwing away work it knows nothing about.
+#
+# With $remove_newer, a rollback the storage refuses because something
+# snapshotted the container after us is tried a second time with those
+# snapshots removed - see rollback_blockers below for why that is the only way
+# through and why it destroys nothing the rollback would have spared.
 #
 # What PVE does with it, read off AbstractConfig and then watched on a real 9.2:
 # it refuses while ANY lock is set - ours included, so the update lock has to be
@@ -426,7 +431,7 @@ sub snapshot_lxc {
 # rollback, and it leaves it stopped. Starting it again afterwards is the
 # caller's job, and only the caller knows whether it was running to begin with.
 sub rollback_lxc {
-    my ($vmid, $name, $logfunc) = @_;
+    my ($vmid, $name, $logfunc, $remove_newer) = @_;
 
     my $safe = _safe_vmid($vmid);
 
@@ -435,9 +440,165 @@ sub rollback_lxc {
 
     $logfunc->("rolling the container back to $name") if $logfunc;
 
+    return 1 if eval { PVE::LXC::Config->snapshot_rollback($safe, $name); 1 };
+
+    my $err = $@ || "rolling back to $name failed\n";
+    die $err if !$remove_newer;
+
+    # A second attempt, and only ever this one. The refusal that brings us here
+    # is decided BEFORE anything is stopped or written - AbstractConfig checks
+    # every volume first - so the failed attempt has changed nothing, and a
+    # blocker that appeared in the meantime would only produce the same refusal
+    # again. One retry ends; a loop would race the very tool that took the
+    # snapshot.
+    chomp(my $refused = $err);
+    $logfunc->("the rollback was refused - $refused") if $logfunc;
+
+    die $err if !clear_rollback_blockers($safe, $name, $logfunc);
+
     PVE::LXC::Config->snapshot_rollback($safe, $name);
 
     return 1;
+}
+
+# What a storage names when it refuses a rollback, and what it is called here.
+#
+# A rollback undoes the volume, not a list of snapshots, so every snapshot taken
+# AFTER the one being rolled back to disappears with it - that is what `zfs
+# rollback -r` does, and it is the only thing it can do. ZFS, classic LVM and
+# qcow2 snapshot chains therefore refuse outright while such a snapshot exists
+# ("can't rollback, 'X' is not most recent snapshot on 'Y'", ZFSPoolPlugin.pm on
+# pve-manager 9.2.4); btrfs and LVM-thin roll back regardless and never produce
+# one of these.
+#
+# There is no force to pass on: neither snapshot_rollback, nor the API endpoint,
+# nor `pct rollback` has such a parameter. Clearing the way means removing those
+# snapshots first, and the reason that is not the data loss it looks like is the
+# first paragraph: they do not survive the rollback either way.
+#
+# Returns them per volume, because removing one is two different operations
+# depending on where it lives - see clear_rollback_blockers below.
+sub rollback_blockers {
+    my ($vmid, $name) = @_;
+
+    my $conf = eval { PVE::LXC::Config->load_config($vmid) } // {};
+    my $snap = $conf->{snapshots}->{$name};
+    return {} if !$snap;
+
+    my $storecfg = eval { PVE::Storage::config() };
+    return {} if !defined($storecfg);
+
+    my $per_volume = {};
+
+    PVE::LXC::Config->foreach_volume(
+        $snap,
+        sub {
+            my ($ms, $mountpoint) = @_;
+
+            # Bind mounts and passed-through devices have no storage to ask.
+            # PVE's own snapshot code skips them the same way, by type rather
+            # than by guessing from the string - see __snapshot_activate_storages.
+            return if ($mountpoint->{type} // '') ne 'volume';
+
+            my $blockers = [];
+
+            # This dies when the rollback is impossible, and the die is the
+            # answer: the plugin fills $blockers on its way out. Anything else
+            # it dies of - an unparsable volume, a storage that is not there -
+            # leaves the list empty, which reads as "nothing here to clear" and
+            # keeps the caller reporting the original refusal.
+            eval {
+                PVE::Storage::volume_rollback_is_possible(
+                    $storecfg, $mountpoint->{volume}, $name, $blockers,
+                );
+            };
+
+            $per_volume->{ $mountpoint->{volume} } = $blockers if scalar(@$blockers);
+        },
+    );
+
+    return $per_volume;
+}
+
+# Snapshots PVE's replication owns. snapshot_rollback removes the ones in its
+# way itself, before the check that produces the list above, so one reaching
+# this code would be a surprise - and removing it by hand is how a replication
+# job is made to start from the beginning. Left alone, and said out loud.
+our $REPLICATION_PREFIX = '__replicate_';
+
+# Removes what rollback_blockers found. Returns how many went away.
+#
+# This is the one place in the addon that removes a snapshot it did not take.
+# It is deliberate and it is narrow: only snapshots the storage itself named as
+# standing between the container and the rollback, only after a rollback has
+# already been refused, and only with the setting on. Everything else this
+# addon touches is still ours and ours alone - the pruning above checks
+# is_our_snapshot for exactly that reason.
+sub clear_rollback_blockers {
+    my ($vmid, $name, $logfunc) = @_;
+
+    my $per_volume = rollback_blockers($vmid, $name);
+    return 0 if !scalar(keys %$per_volume);
+
+    my $storecfg = eval { PVE::Storage::config() };
+    return 0 if !defined($storecfg);
+
+    my $snapshots = eval { PVE::LXC::Config->load_config($vmid)->{snapshots} } || {};
+
+    my $removed = 0;
+    my %done;
+
+    for my $volid (sort keys %$per_volume) {
+        for my $blocker (@{ $per_volume->{$volid} }) {
+            # Cannot happen - a plugin only lists what came after - and cheap
+            # enough to make sure of, because getting it wrong here deletes the
+            # rollback point itself.
+            next if $blocker eq $name;
+
+            if ($blocker =~ m/\A\Q$REPLICATION_PREFIX\E/) {
+                $logfunc->("leaving the replication snapshot $blocker alone -"
+                    . " it belongs to PVE's replication, not to this addon")
+                    if $logfunc;
+                next;
+            }
+
+            # Two homes, two removals. A snapshot taken through PVE - by hand,
+            # by the API, by a tool that uses it - is in the container's config
+            # and has to go through snapshot_delete, which removes it from every
+            # volume and from the config. One taken on the storage directly, by
+            # a tool that calls `zfs snapshot` itself, is not in the config at
+            # all: snapshot_delete would die with "does not exist" and leave the
+            # rollback just as blocked, so that one is removed per volume.
+            my $in_config = $snapshots->{$blocker} ? 1 : 0;
+            next if $in_config && $done{$blocker}++;
+
+            $logfunc->(
+                "removing the snapshot $blocker, which is newer than $name and blocks the"
+                . " rollback - a rollback to $name destroys it either way")
+                if $logfunc;
+
+            my $ok = $in_config
+                ? eval { PVE::LXC::Config->snapshot_delete($vmid, $blocker, 0); 1 }
+                : eval { PVE::Storage::volume_snapshot_delete($storecfg, $volid, $blocker); 1 };
+
+            if ($ok) {
+                $removed++;
+                next;
+            }
+
+            my $err = $@ // '';
+            chomp($err);
+            $logfunc->("WARNING: could not remove $blocker - $err") if $logfunc;
+
+            # Only the config path can wedge the container: snapshot_delete
+            # writes the lock and `snapstate: delete` before it asks the storage.
+            # The repair is allowed past its own guard here because this blocker
+            # is one we were told to remove - see the parameter's comment.
+            _repair_stuck_delete($vmid, $blocker, $logfunc, 1) if $in_config;
+        }
+    }
+
+    return $removed;
 }
 
 # Keeps the newest $keep of OUR snapshots and removes the rest.
@@ -499,10 +660,16 @@ sub _clear_delete_lock {
 # The force pass can leave the volume itself on the storage - that is what force
 # means - so it says so with the name to look for rather than reporting a clean
 # removal.
+#
+# $foreign_ok is the one way past the is_our_snapshot guard below, and it has
+# exactly one caller: clear_rollback_blockers, which removes a snapshot that is
+# not ours on purpose. Without it, a storage failure there would leave the
+# container locked and the snapshot half deleted for good - the guard would
+# protect the snapshot from being tidied up after it had already been destroyed.
 sub _repair_stuck_delete {
-    my ($vmid, $name, $logfunc) = @_;
+    my ($vmid, $name, $logfunc, $foreign_ok) = @_;
 
-    return 0 if !is_our_snapshot($name);
+    return 0 if !$foreign_ok && !is_our_snapshot($name);
 
     my $conf = eval { PVE::LXC::Config->load_config($vmid) } // {};
     my $snap = $conf->{snapshots}->{$name};

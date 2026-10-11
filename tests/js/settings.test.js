@@ -21,24 +21,33 @@ const SOURCE = fs.readFileSync(
     path.resolve(__dirname, '..', '..', 'js', 'pve-update-manager.js'),
     'utf8',
 );
-const DEFINED_ITEM_IDS = new Set(
-    [...SOURCE.matchAll(/itemId:\s*'([^']+)'/g)].map((m) => m[1]),
-);
+// Literal itemIds, plus the two each parallelRow() call defines - the parallel
+// switch and its "at most N" field are built by one helper for both rows.
+const DEFINED_ITEM_IDS = new Set([
+    ...[...SOURCE.matchAll(/itemId:\s*'([^']+)'/g)].map((m) => m[1]),
+    ...[...SOURCE.matchAll(/parallelRow\('([^']+)',\s*'([^']+)'\)/g)].flatMap((m) => [m[1], m[2]]),
+]);
 
 // Everything the server answers with, all of it different from the defaults so
 // a value that is quietly dropped cannot pass by accident.
 const ANSWER = {
     parallel_manual: 1,
+    parallel_manual_max: 4,
     timeout: 600,
     start_stopped: 1,
     snapshot_before: 1,
     snapshot_keep: 4,
     snapshot_shutdown: 1,
+    rollback_on_failure: 1,
+    // The one switch here whose default is ON, so 0 is the value that differs -
+    // and the one a `|| default` in the load would quietly turn back on.
+    rollback_remove_newer: 0,
     notify_failure: 1,
     script_versions: 5,
     schedule_enabled: 1,
     schedule_time: '04:00',
     schedule_parallel: 1,
+    schedule_parallel_max: 6,
     schedule_host: 1,
     schedule_vmids: '101',
     snapshot_capable: 1,

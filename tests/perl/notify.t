@@ -136,7 +136,7 @@ is(
         'none was taken',
         'a target without a snapshot says so rather than leaving the line blank',
     );
-    like($second->{rollback}, qr/no snapshot of this container/, 'and nothing to go back to');
+    like($second->{rollback}, qr/no snapshot to go back to/, 'and nothing to go back to');
     is(
         $second->{also},
         '4212 further output lines not logged',
@@ -185,7 +185,7 @@ is(
     );
     like(
         $rollback_of->({}),
-        qr/no snapshot of this container/,
+        qr/no snapshot to go back to/,
         'no snapshot at all, which is a different answer from "not rolled back"',
     );
 }

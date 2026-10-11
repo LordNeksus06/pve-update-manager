@@ -107,11 +107,15 @@ sub ensure_base_dir {
 sub script_file {
     my ($type, $id) = @_;
 
-    die "unknown target type '$type'\n" if $type ne 'lxc' && $type ne 'node';
+    # 'qemu' is a type of its own rather than folded into 'lxc', although a
+    # vmid is unique across both: the type is the prefix of every file a target
+    # has, and a VM stored as lxc-200.conf would be read back as a container by
+    # anything that walks the directory.
+    die "unknown target type '$type'\n" if $type ne 'lxc' && $type ne 'qemu' && $type ne 'node';
     die "missing target id\n" if !defined($id) || $id eq '';
 
     my $safe;
-    if ($type eq 'lxc') {
+    if ($type ne 'node') {
         ($safe) = $id =~ m/\A([1-9][0-9]{2,8})\z/
             or die "invalid vmid '$id'\n";
     } else {
@@ -1193,33 +1197,47 @@ sub settings_file {
 
 our $DEFAULT_SNAPSHOT_KEEP = 3;
 
+# How many targets of one parallel wave may run at once. 0 is no cap, which is
+# what a parallel run did before the setting existed, so an upgrade changes
+# nothing until somebody sets a number. The ceiling is only there so a typo
+# cannot be stored; a wave never holds more targets than the node has.
+our $MAX_PARALLEL = 100;
+
 # One is the floor and not zero: keeping none would delete the snapshot the run
 # had just taken, which is the opposite of what the setting is for.
 our $MIN_SNAPSHOT_KEEP = 1;
 our $MAX_SNAPSHOT_KEEP = 100;
 
-# snapshot_before and notify_failure are the two switches here that start ON.
-# Every other one changes what a run DOES and so has to be asked for; these two
-# do not. snapshot_before only adds something to undo a run with, and it does
-# nothing at all where the storage cannot snapshot. notify_failure only says out
-# loud what already happened - and the run it reports on is an unattended one at
-# 03:00, where the alternative to a notification is nobody finding out. So for
-# once the cautious default and the useful one are the same value.
+# snapshot_before, notify_failure and rollback_remove_newer are the three
+# switches here that start ON. Every other one changes what a run DOES and so
+# has to be asked for; these three do not. snapshot_before only adds something
+# to undo a run with, and it does nothing at all where the storage cannot
+# snapshot. notify_failure only says out loud what already happened - and the
+# run it reports on is an unattended one at 03:00, where the alternative to a
+# notification is nobody finding out. rollback_remove_newer does nothing unless
+# rollback_on_failure is on, which is the switch that already says "throw away
+# everything since the snapshot"; all it decides is whether that instruction is
+# carried out or refused because something else snapshotted the container in
+# the meantime. So for once the cautious default and the useful one are the
+# same value.
 sub default_settings {
     return {
         parallel_manual => 0,
+        parallel_manual_max => 0,
         timeout => $PVE::UpdateManager::Runner::DEFAULT_TIMEOUT,
         start_stopped => 0,
         snapshot_before => 1,
         snapshot_keep => $DEFAULT_SNAPSHOT_KEEP,
         snapshot_shutdown => 0,
         rollback_on_failure => 0,
+        rollback_remove_newer => 1,
         notify_failure => 1,
         script_versions => $DEFAULT_SCRIPT_VERSIONS,
         run_logs => $DEFAULT_RUN_LOGS,
         schedule_enabled => 0,
         schedule_time => '03:00',
         schedule_parallel => 0,
+        schedule_parallel_max => 0,
         schedule_host => 0,
         schedule_vmids => '',
         last_run => 0,
@@ -1235,6 +1253,12 @@ sub settings_schema {
         parallel_manual => {
             type => 'boolean',
             description => "Start all targets at once when Update Selected is pressed.",
+        },
+        parallel_manual_max => {
+            type => 'integer',
+            minimum => 0,
+            maximum => $MAX_PARALLEL,
+            description => "Manual parallel runs: at most this many targets at once. 0 = no limit.",
         },
         timeout => {
             type => 'integer',
@@ -1284,6 +1308,19 @@ sub settings_schema {
                 . " again afterwards. Only a snapshot this addon took in this run is ever"
                 . " rolled back to.",
         },
+        rollback_remove_newer => {
+            type => 'boolean',
+            description => "Let a rollback remove snapshots that are newer than the one it"
+                . " goes back to, when the storage refuses the rollback because of them. On"
+                . " by default, and it only ever applies while rollback_on_failure is on."
+                . " ZFS, classic LVM and qcow2 chains refuse to roll back while a newer"
+                . " snapshot exists - one an auto-snapshot tool took during the update, for"
+                . " instance - and there is no force to pass on: the rollback destroys those"
+                . " snapshots either way, so the only way through is to remove them first."
+                . " This is the one case in which a snapshot the Update Manager did not take"
+                . " is removed, and the run names every one of them in its log. Switched off,"
+                . " such a rollback fails and the container stays on the failed update.",
+        },
         notify_failure => {
             type => 'boolean',
             description => "Send a notification when a run had a target fail. On by default."
@@ -1329,6 +1366,12 @@ sub settings_schema {
         schedule_parallel => {
             type => 'boolean',
             description => "Start all targets at once on a scheduled run too.",
+        },
+        schedule_parallel_max => {
+            type => 'integer',
+            minimum => 0,
+            maximum => $MAX_PARALLEL,
+            description => "Scheduled parallel runs: at most this many targets at once. 0 = no limit.",
         },
         schedule_host => {
             type => 'boolean',
@@ -1412,6 +1455,12 @@ sub load_settings {
             $keep = $MIN_SCRIPT_VERSIONS if $keep < $MIN_SCRIPT_VERSIONS;
             $keep = $MAX_SCRIPT_VERSIONS if $keep > $MAX_SCRIPT_VERSIONS;
             $res->{$key} = $keep;
+        } elsif ($key eq 'parallel_manual_max' || $key eq 'schedule_parallel_max') {
+            # Clamped, like the counts above. Above the ceiling means "more than
+            # any wave holds", which the ceiling says just as well.
+            my $max = ($value =~ m/\A\d+\z/) ? int($value) : $res->{$key};
+            $max = $MAX_PARALLEL if $max > $MAX_PARALLEL;
+            $res->{$key} = $max;
         } elsif ($key eq 'schedule_vmids') {
             $res->{$key} = ($value =~ m/\A\d+(?:,\d+)*\z/) ? $value : '';
         } elsif ($key eq 'schedule_time') {
@@ -1495,6 +1544,12 @@ sub save_settings {
         || $versions < $MIN_SCRIPT_VERSIONS
         || $versions > $MAX_SCRIPT_VERSIONS;
 
+    for my $key (qw(parallel_manual_max schedule_parallel_max)) {
+        my $max = $merged->{$key};
+        die "invalid $key '" . ($max // '') . "' - must be between 0 and $MAX_PARALLEL\n"
+            if !defined($max) || $max !~ m/\A\d+\z/ || $max > $MAX_PARALLEL;
+    }
+
     return _write_settings($node, $merged);
 }
 
@@ -1540,7 +1595,7 @@ sub next_schedule_run {
 # behaves differently from the manual one somebody tested with. That has
 # happened once already, which is why this exists rather than three literals.
 sub run_opts {
-    my ($settings, $parallel) = @_;
+    my ($settings, $parallel, $parallel_max) = @_;
 
     return {
         start_stopped => $settings->{start_stopped},
@@ -1548,6 +1603,7 @@ sub run_opts {
         snapshot_keep => $settings->{snapshot_keep},
         snapshot_shutdown => $settings->{snapshot_shutdown},
         rollback_on_failure => $settings->{rollback_on_failure},
+        rollback_remove_newer => $settings->{rollback_remove_newer},
         notify_failure => $settings->{notify_failure},
         # Carried into the run rather than read again per target: forty targets
         # would otherwise be forty reads of the same settings file, and a setting
@@ -1559,6 +1615,10 @@ sub run_opts {
         # out at all. Passing it makes every caller answer the question instead
         # of one of them quietly inheriting the other one's answer.
         parallel => $parallel ? 1 : 0,
+        # The cap travels with its switch for the same reason: each of the two
+        # switches has its own number, and a caller that passes the switch has to
+        # pass the number that belongs to it.
+        parallel_max => $parallel ? int($parallel_max // 0) : 0,
     };
 }
 

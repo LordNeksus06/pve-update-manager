@@ -105,6 +105,10 @@ function load(answer, options) {
                         .replace(/"/g, '&quot;')
                         .replace(/'/g, '&#39;'),
             },
+            // The real ones, as far as the tab injection uses them: isArray is
+            // Array.isArray where the browser has it, apply copies own keys.
+            isArray: Array.isArray,
+            apply: (target, source) => Object.assign(target, source),
             state: {
                 Manager: {
                     get: function (key) {

@@ -135,7 +135,7 @@ sub _target_block {
             ? 'yes - but the container did NOT come back up afterwards'
         : $facts->{rolled_back} ? 'yes - the update was taken back'
         : defined($snapshot) ? 'no - the snapshot above is still there to go back to'
-        : 'no - there is no snapshot of this container to go back to';
+        : 'no - there is no snapshot to go back to';
 
     return {
         target => $result->{desc},

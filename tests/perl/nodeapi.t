@@ -16,10 +16,13 @@ use strict;
 use warnings;
 
 use File::Temp qw(tempdir);
-use Test::More tests => 35;
+use Test::More tests => 43;
 
 use PVE::LXC;
 use PVE::LXC::Config;
+use PVE::QemuConfig;
+use PVE::QemuServer;
+use PVE::QemuServer::Helpers;
 use PVE::RESTHandler;
 use PVE::RPCEnvironment;
 use PVE::Storage;
@@ -29,6 +32,10 @@ use PVE::UpdateManager::NodeAPI;
 
 my $dir = tempdir(CLEANUP => 1);
 $PVE::UpdateManager::Config::BASE_DIR = "$dir/store";
+
+# The run below never reaches Job (run_all is replaced), but a test that names
+# Job pins the cgroup it would read - see tests/run-tests.sh.
+$PVE::UpdateManager::Runner::CGROUP_FILE = "$dir/no-such-cgroup";
 
 my $targets = PVE::RESTHandler::registered('PVE::UpdateManager::NodeAPI', 'targets');
 my $run = PVE::RESTHandler::registered('PVE::UpdateManager::NodeAPI', 'run');
@@ -202,4 +209,77 @@ sub call_run {
         # place, and check the privileges of the wrong node's path.
         is($def->{proxyto}, 'node', "$name is answered by the node it is about");
     }
+}
+
+# ── the run is given the node's own parallel cap ────────────────────────────
+#
+# The cap is a setting of the node, read by the endpoint and handed to the job.
+# Checked at the hand-over, because a run that never receives the number runs
+# uncapped and still reports success.
+{
+    PVE::UpdateManager::Config::save_settings(
+        'pve-test', { parallel_manual => 1, parallel_manual_max => 3 },
+    );
+
+    my $call = call_run(vmids => '101');
+    is(scalar(@{ $call->{forked} }), 1, 'a run was started to look at');
+
+    my $opts;
+    {
+        no warnings 'redefine';
+        local *PVE::UpdateManager::Job::run_all = sub { $opts = $_[2] };
+        $call->{forked}->[0]->{code}->();
+    }
+
+    is($opts->{parallel}, 1, 'the run is parallel, as the node says');
+    is($opts->{parallel_max}, 3, 'and capped at the number the node stores');
+
+    PVE::UpdateManager::Config::save_settings(
+        'pve-test', { parallel_manual => 0, parallel_manual_max => 0 },
+    );
+}
+
+# ── VMs are targets too ─────────────────────────────────────────────────────
+#
+# A vmid is unique across containers and VMs, so the run endpoint keeps taking a
+# plain list and the node tells the kinds apart. Checked at the hand-over: a VM
+# that reached the job as a container would be run through pct, which answers
+# "not a container".
+{
+    local %PVE::QemuServer::CONFIG_LIST = (200 => {});
+    local %PVE::QemuConfig::CONFIGS = (200 => { name => 'vm-web', agent => '1' });
+    local %PVE::QemuServer::Helpers::RUNNING = (200 => 1);
+    local $PVE::LXC::Config::NO_CONFIG{200} = 1;
+
+    my $res = $targets->({ node => 'pve-test' });
+    is_deeply(
+        ids_of($res),
+        ['node:pve-test', 'lxc:101', 'lxc:102', 'qemu:200'],
+        'the list carries the VM after the containers',
+    );
+    my ($vm) = grep { $_->{id} eq '200' } @$res;
+    is($vm->{name}, 'vm-web', "a VM row carries the VM's name");
+    is($vm->{status}, 'running', 'and its status');
+
+    {
+        local $PVE::RPCEnvironment::CHECK = sub { return $_[0] ne '/vms/200' };
+        is_deeply(
+            ids_of($targets->({ node => 'pve-test' })),
+            ['node:pve-test', 'lxc:101', 'lxc:102'],
+            'a VM the user may not audit is left out like a container',
+        );
+    }
+
+    my $call = call_run(vmids => '101,200');
+    my $handed;
+    {
+        no warnings 'redefine';
+        local *PVE::UpdateManager::Job::run_all = sub { $handed = $_[0] };
+        $call->{forked}->[0]->{code}->();
+    }
+    is_deeply(
+        [map { "$_->{type}:$_->{id}" } @$handed],
+        ['lxc:101', 'qemu:200'],
+        'one request with a container and a VM hands each to the job as what it is',
+    );
 }

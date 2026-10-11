@@ -1,3 +1,5 @@
 deb-out/
 *.deb
 *.tar.gz
+# Worktrees of parallel sessions: full copies of the tree, never content.
+.claude/worktrees/

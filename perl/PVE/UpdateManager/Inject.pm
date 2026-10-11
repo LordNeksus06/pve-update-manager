@@ -1,6 +1,6 @@
 package PVE::UpdateManager::Inject;
 
-# Hooks the two API subtrees into Proxmox' route table.
+# Hooks the API subtrees into Proxmox' route table.
 #
 # pvedaemon and pveproxy load this module (one `eval { require ... }` line added
 # to each by the install hook). Doing it here instead of patching PVE::API2::LXC
@@ -25,7 +25,7 @@ my $registered = 0;
 sub register {
     return 1 if $registered;
 
-    # One eval PER subtree, not one around all three. Sharing an eval means a
+    # One eval PER subtree, not one around all of them. Sharing an eval means a
     # single unloadable module takes every tab down with it - lose the cluster
     # resource index and the container tab disappears too, for no reason. Each
     # subtree now fails on its own and says which one.
@@ -39,6 +39,19 @@ sub register {
 
             PVE::API2::LXC->register_method({
                 subclass => "PVE::UpdateManager::LXCAPI",
+                path => '{vmid}/updatemgr',
+            });
+        },
+    );
+
+    $ok += _register_one(
+        'VM',
+        sub {
+            require PVE::API2::Qemu;
+            require PVE::UpdateManager::QemuAPI;
+
+            PVE::API2::Qemu->register_method({
+                subclass => "PVE::UpdateManager::QemuAPI",
                 path => '{vmid}/updatemgr',
             });
         },

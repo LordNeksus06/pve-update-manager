@@ -1,7 +1,7 @@
 # pve-update-manager
 
-An **Update Manager** tab for Proxmox VE — one per LXC container, one per node,
-one for the datacenter. You write the update commands, the addon runs them as a
+An **Update Manager** tab for Proxmox VE — one per LXC container, one per Linux
+VM, one per node, one for the datacenter. You write the update commands, the addon runs them as a
 normal Proxmox task and records how each target's last run ended.
 
 ![The Update Manager tab of a container, showing its stored apt commands](../docs/img/container-tab.png)
@@ -14,6 +14,8 @@ normal Proxmox task and records how each target's last run ended.
 
 - **Container tab** — a text box with that container's commands and an *Update*
   button. Nothing is generated or guessed from the distribution.
+- **VM tab** — the same for a Linux VM, run through the QEMU guest agent. See
+  [VMs](#vms) for what a VM needs and what it does not get yet.
 - **Node tab** — the host and every container on it in one list, with each
   target's last state and a 📄 to its log. Tick some and *Update Selected*, or
   press ▶ / ✎ / 🗑 on a single row.
@@ -79,15 +81,18 @@ the node they run on.
 | `snapshot_keep` | 3 | how many of *our* snapshots to keep per container (1–100) |
 | `snapshot_shutdown` | off | shut a running container down for its snapshot, start it again after |
 | `rollback_on_failure` | off | roll the container back to that snapshot when the update fails |
+| `rollback_remove_newer` | on | let that rollback remove snapshots newer than the one it goes back to, when the storage refuses it because of them |
 | `notify_failure` | on | notify when a run had a target fail |
 | `script_versions` | 3 | saved versions of each target's commands to keep (1–50) |
 | `run_logs` | 3 | logs of past runs to keep per target (0–50, 0 keeps none) |
 | `parallel_manual` | off | *Update Selected* runs a whole update-order position at once |
+| `parallel_manual_max` | 0 | at most this many targets of a position at once (0–100, 0 = no limit) |
 | `timeout` | 14400 | seconds before a target's update is killed (10–86400) |
 | `start_stopped` | off | start a stopped container for its update, stop it after |
 | `schedule_enabled` | off | run the selected targets on a schedule |
 | `schedule_time` | `03:00` | systemd calendar event |
 | `schedule_parallel` | off | the same for a scheduled run |
+| `schedule_parallel_max` | 0 | the same cap for a scheduled run |
 | `schedule_host` | off | include the node's own script in scheduled runs |
 | `schedule_vmids` | — | which containers the schedule runs |
 
@@ -104,6 +109,7 @@ is written.
 | snapshot fails | the target fails before the update starts |
 | `snapshot_shutdown` on | shut down, snapshotted, started again, then updated |
 | `rollback_on_failure` on, update failed | rolled back to that snapshot, and started again if it was running |
+| something snapshotted the container during the update | the storage refuses the rollback; with `rollback_remove_newer` on, those snapshots are removed and the rollback goes ahead |
 
 Good to know:
 
@@ -133,6 +139,21 @@ Good to know:
   its update stays stopped. The row says *rolled back to …* instead of naming a
   snapshot to go back to, because the container is no longer the one the update
   left behind. A rollback that fails says so on the row.
+- `rollback_remove_newer` exists because a rollback is not a list of snapshots,
+  it is the volume going back: ZFS, classic LVM and qcow2 chains refuse to roll
+  back at all while a *newer* snapshot exists (`can't rollback, 'X' is not most
+  recent snapshot on 'Y'`), and there is no force to pass on - neither PVE's API
+  nor `pct rollback` has one. The usual way to hit it is an auto-snapshot tool
+  firing while the update runs. With this on, those snapshots are removed and
+  the rollback is tried once more; the run names every one of them in the log.
+  Nothing that could have survived is lost - a rollback destroys every snapshot
+  newer than the one it goes back to either way, which is exactly why the
+  storage refuses. This is the one case in which a snapshot the addon did not
+  take is removed: only ones the storage itself named as standing in the way,
+  only after a rollback was refused, and never PVE's own replication snapshots,
+  which belong to the replication job. Off, such a rollback fails and the
+  container stays on the failed update. btrfs and LVM-thin never refuse, so the
+  setting does nothing there.
 - A worker that is killed - node reboot, out-of-memory - never gives the
   `mounted` lock back, and every later run then skips that container with
   *another task holds the lock*. Where nothing has touched the container for ten
@@ -269,6 +290,14 @@ once, and the next position does not start until the last target of the previous
 one is done. Targets with no number are one final position, all at once — so a
 parallel run nobody has given an order to is still fully parallel.
 
+A cap (`parallel_manual_max`, `schedule_parallel_max`; next to the parallel
+switch in the settings) limits how many targets of one position run at the same
+time; the next starts when one finishes, and the next position still waits for
+the whole of this one. Measured before it existed: 36 targets started in the
+same second, the node's DNS and proxy containers among them, and the failures
+that night were network fetches that went through when retried one at a time.
+Giving such infrastructure an earlier position keeps it out of the crowd.
+
 ```
 position 1 of 3: CT 101 (db)
 position 2 of 3: CT 102 (web), CT 103 (web2)     <- both at once
@@ -400,12 +429,65 @@ Good to know:
   variable at the top. It does not reboot. On Ubuntu, *no new release available*
   is reported as a successful run.
 
+## VMs
+
+A Linux VM is a target like a container: it has a tab, a script, a place in the
+update order, a schedule entry and run logs, and it shows up in the node and
+datacenter lists. The commands are run through the **QEMU guest agent** - no SSH,
+no keys, no network path from the node to the VM.
+
+What a VM needs:
+
+| | |
+| --- | --- |
+| the guest agent enabled | *Options → QEMU Guest Agent* in the VM, i.e. `agent: 1` in its config |
+| `qemu-guest-agent` running inside | without it the target **fails** and the failure notification goes out - a VM that silently never gets updated is the outcome this avoids |
+| `sh`, `base64`, `timeout` | coreutils has all three |
+| systemd | for the scope described below; without it the run still works and the log warns |
+
+How it runs, and why:
+
+- The agent gives no live output - `guest-exec-status` returns nothing until the
+  process has ended, and then everything at once. So the script writes into a
+  file in `/var/tmp` inside the VM (mode 0600) and the node reads it every 2
+  seconds while it grows; the task log fills line by line as with a container.
+  The file is removed afterwards.
+- The script runs in a **systemd scope of its own** inside the VM. Whatever the
+  agent starts otherwise lives in `qemu-guest-agent.service`, and that unit is
+  stopped when the `qemu-guest-agent` package is upgraded - which killed a
+  dist-upgrade halfway through dpkg and left the package half configured. Moved
+  out, the update runs on; the node notices that the agent was restarted, opens
+  the log again where it stopped and learns the exit code from a second file.
+- Everything sent to the agent is ASCII: the script travels base64-encoded. One
+  non-ASCII character in an agent argument made the agent stop answering, once
+  until it was restarted inside the VM. A shebang line with non-ASCII in it is
+  refused before anything is sent.
+- The time limit is enforced inside the VM by `timeout`, as in a container; the
+  node cannot kill a process inside a VM.
+- **Nothing gets switched off mid-update**: the VM carries the config lock
+  `backup` while it updates, so PVE refuses shutdown, stop and migrate - the
+  same mechanism as the container's `mounted`. PVE has no neutral lock value for
+  VMs, and `backup` is the chosen trade-off: the interface shows the VM as
+  locked by a backup during the update, and a backup job that runs in that time
+  **fails** for this VM (`Backup of VM … failed - VM is locked (backup)`, the job
+  ends "with errors" and notifies). Schedule backups and updates apart. A VM that already carries a lock - a real backup, a migration - is
+  skipped. A worker that is killed mid-update leaves the lock behind;
+  `qm unlock <vmid>` clears it.
+
+Not built yet for VMs:
+
+- **snapshots** before the update and the rollback: a VM is updated without one,
+  and the log says so;
+- **starting a stopped VM** for its update: a stopped VM is skipped, also with
+  `start_stopped` on, and the row says why;
+
 ## Which shell runs your commands
 
 The first line may be a shebang and picks the interpreter; the default is
 `/bin/sh`. The script is passed as a single argument (`sh -c '<script>'`), never
 re-parsed by another shell. On the node it runs directly, in a container through
-`pct exec` — a stopped container is skipped unless `start_stopped` is on.
+`pct exec` — a stopped container is skipped unless `start_stopped` is on — and in
+a VM through the guest agent (see [VMs](#vms)).
 
 ## Umlauts, emoji and colour
 
@@ -434,9 +516,9 @@ Good to know:
 
 | Action | Needs |
 | --- | --- |
-| see a container's tab and script | `VM.Audit` on `/vms/<vmid>` |
-| edit a container's script | `VM.Config.Options` on `/vms/<vmid>` |
-| run a container's script | `VM.Console` on `/vms/<vmid>` |
+| see a container's or VM's tab and script | `VM.Audit` on `/vms/<vmid>` |
+| edit a container's or VM's script | `VM.Config.Options` on `/vms/<vmid>` |
+| run a container's or VM's script | `VM.Console` on `/vms/<vmid>` |
 | see the node tab | `Sys.Audit` on `/nodes/<node>` |
 | edit the host script | `Sys.Modify` on `/nodes/<node>` |
 | run the host script | `Sys.Console` on `/nodes/<node>` |
@@ -488,9 +570,12 @@ Good to know:
 - `run` returns a UPID; it also lands in the target's `last_upid`, which is what
   the 📄 button opens.
 - A container with no script stored starts no task and is recorded as `skipped`.
-- So is one whose config is not on this node — it has migrated away, or the vmid
-  names a VM. The scripts live in `/etc/pve` and are the same everywhere, so it
-  would otherwise be found and reported as "not running".
+- So is one whose config is not on this node — it has migrated away. The
+  scripts live in `/etc/pve` and are the same everywhere, so it would otherwise be
+  found and reported as "not running".
+- The node's `run` takes container and VM ids in the same `vmids` list: a vmid is
+  unique across both, and the node tells them apart. The per-guest endpoints are
+  `/nodes/<node>/lxc/<vmid>/updatemgr/...` and `/nodes/<node>/qemu/<vmid>/updatemgr/...`.
 - `run --script ...` stores before running and therefore needs
   `VM.Config.Options` on top of `VM.Console`.
 - Storing an empty script is refused; removing is its own operation.
@@ -498,13 +583,15 @@ Good to know:
   takes those, the saved versions and the order with it.
 - There is no cluster-wide `run`: the UI fires one `POST` per node in parallel.
 - A single container goes to its own endpoint, so its task is typed `ctupdate`
-  and reads *CT 102 — Update Manager* in the task list.
+  and reads *CT 102 — Update Manager* in the task list; a single VM's is
+  `vmupdate`, *VM 200 — Update Manager*.
 
 ## Files
 
 | Path | What |
 | --- | --- |
 | `/etc/pve/pve-update-manager/lxc-<vmid>.conf` | a container's update commands |
+| `/etc/pve/pve-update-manager/qemu-<vmid>.conf` | a VM's update commands |
 | `/etc/pve/pve-update-manager/node-<node>.conf` | the host's update commands |
 | `/etc/pve/pve-update-manager/*@<date>-<time>[-<user>].conf` | a saved version of those commands |
 | `/etc/pve/pve-update-manager/*.order` | that target's place in a run |

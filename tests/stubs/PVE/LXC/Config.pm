@@ -30,6 +30,14 @@ sub load_config {
     my $conf = $CONFIGS{$vmid} ||= {};
     $conf->{vmid} = $vmid;
 
+    # The same trick, for the same reason, one level down: the real snapshot
+    # config carries its own rootfs line, so foreach_volume on a SNAPSHOT knows
+    # which volume to ask the storage about. Here that volume is derived from
+    # the vmid - see volid_of - and the snapshots have to carry it too, because
+    # the tests write them straight into %CONFIGS without going through
+    # snapshot_create.
+    $_->{vmid} = $vmid for values %{ $conf->{snapshots} // {} };
+
     # The real set_lock writes the lock INTO the config, so anything reading a
     # container's config sees it. Mirroring that here is what lets a test cover
     # the code that checks for somebody else's lock before touching the guest.
@@ -89,6 +97,31 @@ sub remove_lock {
     return;
 }
 
+# The volume a stubbed container has, and the only one. The real one is parsed
+# out of the rootfs line of whatever config is being walked; what the tests are
+# about is which snapshot blocks a rollback, not how a mountpoint string parses.
+our $STORAGE = 'teststore';
+
+sub volid_of {
+    my ($vmid) = @_;
+
+    return "$STORAGE:subvol-$vmid-disk-0";
+}
+
+# Real enough for the one caller that matters: it hands out ('rootfs', a
+# mountpoint hash with a type and a volume), and the type is what PVE's own
+# storage code filters on so a bind mount is never handed to a storage plugin.
+sub foreach_volume {
+    my ($class, $conf, $func, @param) = @_;
+
+    my $vmid = $conf->{vmid};
+    return if !defined($vmid);
+
+    $func->('rootfs', { type => 'volume', volume => volid_of($vmid) }, @param);
+
+    return;
+}
+
 # ── snapshots ───────────────────────────────────────────────────────────────
 #
 # Real enough to test the pruning against: the snapshots live in %CONFIGS, the
@@ -143,6 +176,22 @@ sub snapshot_rollback {
     die "$ROLLBACK_DIE\n" if defined($ROLLBACK_DIE);
     die "snapshot '$snapname' does not exist\n"
         if !$CONFIGS{$vmid}->{snapshots}->{$snapname};
+
+    # Before the lock check and before anything is stopped, which is the order
+    # AbstractConfig works in and the reason a refused rollback leaves the
+    # container exactly as it was: every volume is asked first.
+    my $conf = $class->load_config($vmid);
+    $class->foreach_volume(
+        $conf->{snapshots}->{$snapname},
+        sub {
+            my ($ms, $mountpoint) = @_;
+
+            PVE::Storage::volume_rollback_is_possible(
+                $PVE::Storage::CONFIG, $mountpoint->{volume}, $snapname,
+            );
+        },
+    );
+
     die "CT is locked ($LOCKS{$vmid})\n" if $LOCKS{$vmid};
 
     $PVE::LXC::RUNNING{$vmid} = undef;

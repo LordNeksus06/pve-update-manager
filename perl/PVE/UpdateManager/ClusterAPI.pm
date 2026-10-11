@@ -380,10 +380,11 @@ __PACKAGE__->register_method({
     path => 'targets',
     method => 'GET',
     protected => 1,
-    description => "List every update target in the cluster: every node and every container.",
+    description => "List every update target in the cluster: every node, every container and"
+        . " every VM.",
     permissions => {
         description => "Lists only what the user may see: a node needs Sys.Audit on"
-            . " /nodes/{node}, a container VM.Audit on /vms/{vmid}.",
+            . " /nodes/{node}, a container or VM VM.Audit on /vms/{vmid}.",
         user => 'all',
     },
     parameters => {
@@ -395,8 +396,8 @@ __PACKAGE__->register_method({
         items => {
             type => 'object',
             properties => {
-                type => { type => 'string', enum => ['node', 'lxc'] },
-                id => { type => 'string', description => "Node name for a node, vmid for a container." },
+                type => { type => 'string', enum => ['node', 'lxc', 'qemu'] },
+                id => { type => 'string', description => "Node name for a node, vmid for a guest." },
                 vmid => { type => 'integer', optional => 1 },
                 node => { type => 'string', description => "The node that owns this target." },
                 name => { type => 'string' },
@@ -469,24 +470,24 @@ __PACKAGE__->register_method({
                         ($settings->{snapshot_before} && $settings->{snapshot_shutdown}) ? 1 : 0,
                     %{ PVE::UpdateManager::Config::last_run('node', $node) },
                 };
-            } elsif ($type eq 'lxc') {
+            } elsif ($type eq 'lxc' || $type eq 'qemu') {
                 my $vmid = $r->{vmid};
                 push @$guests, {
-                    type => 'lxc',
+                    type => $type,
                     id => "$vmid",
                     vmid => int($vmid),
                     node => $r->{node},
-                    name => $r->{name} // "CT$vmid",
+                    name => $r->{name} // ($type eq 'qemu' ? 'VM' : 'CT') . $vmid,
                     status => $r->{status} // 'unknown',
                     template => $r->{template} ? 1 : 0,
-                    stored => PVE::UpdateManager::Config::has_script('lxc', $vmid) ? 1 : 0,
-                    order => PVE::UpdateManager::Config::load_order('lxc', $vmid),
-                    %{ PVE::UpdateManager::Config::last_run('lxc', $vmid) },
+                    stored => PVE::UpdateManager::Config::has_script($type, $vmid) ? 1 : 0,
+                    order => PVE::UpdateManager::Config::load_order($type, $vmid),
+                    %{ PVE::UpdateManager::Config::last_run($type, $vmid) },
                 };
             }
         }
 
-        # Nodes first, then containers by id - the same order the node tab uses,
+        # Nodes first, then guests by id - the same order the node tab uses,
         # so switching between the two views does not rearrange the world.
         my $res = [
             (sort { $a->{name} cmp $b->{name} } @$nodes),

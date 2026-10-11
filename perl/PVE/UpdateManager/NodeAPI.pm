@@ -21,6 +21,7 @@ use PVE::RPCEnvironment;
 use PVE::Storage;
 
 use PVE::UpdateManager::Config;
+use PVE::UpdateManager::Guest;
 use PVE::UpdateManager::Job;
 use PVE::UpdateManager::Runner;
 
@@ -193,10 +194,11 @@ __PACKAGE__->register_method({
     method => 'GET',
     protected => 1,
     proxyto => 'node',
-    description => "List every update target on this node: the host itself and every container.",
+    description => "List every update target on this node: the host itself, every container"
+        . " and every VM.",
     permissions => {
         description => "Lists only what the user may see: the host needs Sys.Audit on /nodes/{node},"
-            . " a container VM.Audit on /vms/{vmid}.",
+            . " a container or VM VM.Audit on /vms/{vmid}.",
         user => 'all',
     },
     parameters => {
@@ -210,8 +212,8 @@ __PACKAGE__->register_method({
         items => {
             type => 'object',
             properties => {
-                type => { type => 'string', enum => ['node', 'lxc'] },
-                id => { type => 'string', description => "Node name for the host, vmid for a container." },
+                type => { type => 'string', enum => ['node', 'lxc', 'qemu'] },
+                id => { type => 'string', description => "Node name for the host, vmid for a guest." },
                 vmid => { type => 'integer', optional => 1 },
                 name => { type => 'string' },
                 status => { type => 'string' },
@@ -269,24 +271,28 @@ __PACKAGE__->register_method({
             };
         }
 
-        my $list = PVE::LXC::config_list();
-        for my $vmid (sort { $a <=> $b } keys %$list) {
-            next if !$rpcenv->check($authuser, "/vms/$vmid", ['VM.Audit'], 1);
+        # Containers first, then VMs, each by vmid - the grid sorts for itself,
+        # this only keeps the answer stable.
+        for my $type (@PVE::UpdateManager::Guest::TYPES) {
+            my $list = PVE::UpdateManager::Guest::config_list($type);
+            for my $vmid (sort { $a <=> $b } keys %$list) {
+                next if !$rpcenv->check($authuser, "/vms/$vmid", ['VM.Audit'], 1);
 
-            my $conf = eval { PVE::LXC::Config->load_config($vmid) } || {};
-            my $running = PVE::LXC::check_running($vmid) ? 1 : 0;
+                my $conf = eval { PVE::UpdateManager::Guest::load_config($type, $vmid) } || {};
+                my $running = PVE::UpdateManager::Guest::is_running($type, $vmid);
 
-            push @$res, {
-                type => 'lxc',
-                id => "$vmid",
-                vmid => int($vmid),
-                name => $conf->{hostname} // "CT$vmid",
-                status => $running ? 'running' : 'stopped',
-                template => $conf->{template} ? 1 : 0,
-                stored => PVE::UpdateManager::Config::has_script('lxc', $vmid) ? 1 : 0,
-                order => PVE::UpdateManager::Config::load_order('lxc', $vmid),
-                %{ PVE::UpdateManager::Config::last_run('lxc', $vmid) },
-            };
+                push @$res, {
+                    type => $type,
+                    id => "$vmid",
+                    vmid => int($vmid),
+                    name => PVE::UpdateManager::Guest::name($type, $conf, $vmid),
+                    status => $running ? 'running' : 'stopped',
+                    template => $conf->{template} ? 1 : 0,
+                    stored => PVE::UpdateManager::Config::has_script($type, $vmid) ? 1 : 0,
+                    order => PVE::UpdateManager::Config::load_order($type, $vmid),
+                    %{ PVE::UpdateManager::Config::last_run($type, $vmid) },
+                };
+            }
         }
 
         return $res;
@@ -599,7 +605,7 @@ __PACKAGE__->register_method({
     description => "Run the update scripts of the selected targets in one task."
         . " Returns the UPID of that task.",
     permissions => {
-        description => "Checked per target: VM.Console on /vms/{vmid} for every container,"
+        description => "Checked per target: VM.Console on /vms/{vmid} for every guest,"
             . " Sys.Console on /nodes/{node} when the host is included.",
         user => 'all',
     },
@@ -611,7 +617,7 @@ __PACKAGE__->register_method({
                 type => 'string',
                 optional => 1,
                 pattern => '\d+(,\d+)*',
-                description => "Comma separated list of container ids to update.",
+                description => "Comma separated list of guest ids (containers or VMs) to update.",
             },
             host => {
                 type => 'boolean',
@@ -648,7 +654,7 @@ __PACKAGE__->register_method({
         # is why the update order did nothing there and why nothing knew when the
         # whole run was over.
         my $opts = PVE::UpdateManager::Config::run_opts(
-            $settings, $settings->{parallel_manual},
+            $settings, $settings->{parallel_manual}, $settings->{parallel_manual_max},
         );
 
         my $targets = [];
@@ -661,8 +667,7 @@ __PACKAGE__->register_method({
         if (defined($param->{vmids}) && length($param->{vmids})) {
             for my $vmid (split(/,/, $param->{vmids})) {
                 $rpcenv->check($authuser, "/vms/$vmid", ['VM.Console']);
-                my $name = eval { PVE::LXC::Config->load_config($vmid)->{hostname} };
-                push @$targets, { type => 'lxc', id => $vmid, name => $name };
+                push @$targets, PVE::UpdateManager::Guest::target($vmid);
             }
         }
 
