@@ -6,6 +6,7 @@ Architecture: all
 Maintainer: pve-update-manager <pve-update-manager@localhost>
 License: AGPL-3+
 Depends: pve-manager (>= 9.0), pve-container, libpve-common-perl, libpve-storage-perl, perl
+Recommends: ubuntu-keyring
 Description: Update Manager tab for Proxmox VE containers and nodes
  Adds an "Update Manager" tab to every LXC container, to every node and to the
  datacenter in the Proxmox VE web interface.

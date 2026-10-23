@@ -24,6 +24,9 @@ use PVE::SafeSyslog;
 use PVE::UpdateManager::Config;
 use PVE::UpdateManager::Guest;
 use PVE::UpdateManager::Job;
+use PVE::UpdateManager::SecReact;
+use PVE::UpdateManager::SecScan;
+use PVE::UpdateManager::Settings;
 
 initlog('pve-update-manager-schedule');
 
@@ -35,12 +38,12 @@ if ($cmd ne 'run' && $cmd ne 'status') {
 }
 
 my $nodename = PVE::INotify::nodename();
-my $settings = PVE::UpdateManager::Config::load_settings($nodename);
+my $settings = PVE::UpdateManager::Settings::load_settings($nodename);
 
 # The same options a manual run gets, from the same function, so an unattended
 # run cannot quietly behave differently from the one the operator tried by hand.
 # The scheduled parallel switch is its own, and this is where it is answered.
-my $opts = PVE::UpdateManager::Config::run_opts(
+my $opts = PVE::UpdateManager::Settings::run_opts(
     $settings, $settings->{schedule_parallel}, $settings->{schedule_parallel_max},
 );
 
@@ -59,7 +62,7 @@ sub collect_targets {
 }
 
 if ($cmd eq 'status') {
-    my $due = PVE::UpdateManager::Config::schedule_is_due($settings);
+    my $due = PVE::UpdateManager::Settings::schedule_is_due($settings);
 
     print "node:     $nodename\n";
     print "enabled:  " . ($settings->{schedule_enabled} ? 'yes' : 'no') . "\n";
@@ -77,7 +80,7 @@ if ($cmd eq 'status') {
 
     # From last_run, the same baseline the due calculation uses - printing "next
     # run" from now would disagree with "due now" for a schedule that is overdue.
-    my $upcoming = PVE::UpdateManager::Config::next_schedule_run(
+    my $upcoming = PVE::UpdateManager::Settings::next_schedule_run(
         $settings, $settings->{last_run} || time(),
     );
     my $next =
@@ -88,81 +91,133 @@ if ($cmd eq 'status') {
     print "next run: $next\n";
     print "due now:  " . ($due ? 'yes' : 'no') . "\n";
 
+    # The security check (#40) shares the timer, and this is where an operator
+    # looks for what the timer will do.
+    my $sec = PVE::UpdateManager::SecScan::load_state();
+    print "security: " . ($settings->{security_scan}
+        ? "every $settings->{security_interval} min" : 'off') . "\n";
+    print "checked:  " . ($sec->{last_scan} ? scalar(localtime($sec->{last_scan})) : 'never')
+        . (PVE::UpdateManager::SecScan::busy() ? ' (running now)' : '') . "\n";
+
     exit 0;
 }
 
 # ── run ─────────────────────────────────────────────────────────────────────
 
-exit 0 if !PVE::UpdateManager::Config::schedule_is_due($settings);
+# The update schedule first, then the security check (#40, case "both due in
+# the same tick": one after the other, in this one process). Each ends in a
+# background task, so this oneshot service never waits for either.
 
-my $targets = collect_targets();
-if (!scalar(@$targets)) {
-    syslog('info', "schedule is due but selects no targets - nothing to do");
-    # Still counted as a run: otherwise every timer tick would report the same
-    # thing for ever.
-    PVE::UpdateManager::Config::mark_schedule_run($nodename);
-    exit 0;
+my $env;
+
+sub cli_env {
+    if (!$env) {
+        PVE::RPCEnvironment->setup_default_cli_env();
+        $env = PVE::RPCEnvironment::get();
+    }
+    return $env;
 }
 
-# A run that outlives its own interval would otherwise get a second one started
-# on top of it at the next tick - two apt processes in the same container,
-# fighting over one dpkg lock. Leave the stamp alone so the next tick tries
-# again once the first run is actually finished.
-if (my $busy = PVE::UpdateManager::Config::any_target_running($targets)) {
-    syslog(
-        'info',
-        "schedule is due but $busy->{type} $busy->{id} is still updating - waiting",
-    );
-    exit 0;
+sub run_schedule {
+
+    return 0 if !PVE::UpdateManager::Settings::schedule_is_due($settings);
+
+    my $targets = collect_targets();
+    if (!scalar(@$targets)) {
+        syslog('info', "schedule is due but selects no targets - nothing to do");
+        # Still counted as a run: otherwise every timer tick would report the same
+        # thing for ever.
+        PVE::UpdateManager::Settings::mark_schedule_run($nodename);
+        return 0;
+    }
+
+    # A run that outlives its own interval would otherwise get a second one started
+    # on top of it at the next tick - two apt processes in the same container,
+    # fighting over one dpkg lock. Leave the stamp alone so the next tick tries
+    # again once the first run is actually finished.
+    if (my $busy = PVE::UpdateManager::Config::any_target_running($targets)) {
+        syslog(
+            'info',
+            "schedule is due but $busy->{type} $busy->{id} is still updating - waiting",
+        );
+        return 0;
+    }
+
+    my $rpcenv = cli_env();
+
+    # Stamped BEFORE the work starts. A dist-upgrade can outlive the next few timer
+    # ticks, and a schedule that stamps itself afterwards would start a second run on
+    # top of the first.
+    PVE::UpdateManager::Settings::mark_schedule_run($nodename);
+
+    my $count = scalar(@$targets);
+    my $mode = $settings->{schedule_parallel} ? 'parallel' : 'serial';
+    syslog('info', "starting scheduled update of $count target(s), $mode");
+
+    # ONE worker for the whole run, in both modes. A parallel run is a parallel run
+    # inside that worker - it starts everything sharing an update-order number at
+    # once and waits for the position to finish before the next one - so the two
+    # modes differ in one flag in $opts and in nothing here.
+    #
+    # It used to be one worker per target in parallel mode. Two things were wrong
+    # with that and neither was visible from here: the update order did nothing,
+    # because no worker ever saw more than one target to put in an order; and nothing
+    # knew when the run as a whole was over, which is what a notification about it
+    # needs.
+    #
+    # The 5th argument to fork_worker is `$background`, and leaving it out was a
+    # silent bug: PVE::RESTEnvironment computes
+    #
+    #     my $sync = ($self->{type} eq 'cli' && !$background) ? 1 : 0;
+    #
+    # and setup_default_cli_env() builds a 'cli' environment - so the call ran
+    # SYNCHRONOUSLY. "started $upid" was then logged after the run had already
+    # finished, and the timer's oneshot service stayed active for the whole thing.
+    my $upid = eval {
+        $rpcenv->fork_worker(
+            'updatemgr',
+            $nodename,
+            'root@pam',
+            sub { PVE::UpdateManager::Job::run_all($targets, $settings->{timeout}, $opts) },
+            1,    # background
+        );
+    };
+    if (my $err = $@) {
+        syslog('err', "unable to start the scheduled update: $err");
+        return 1;
+    }
+    syslog('info', "started $upid");
+
+    # With $background set, fork_worker returns as soon as the worker exists. Waiting
+    # here would hold the timer's oneshot service open for the length of a
+    # dist-upgrade.
+    return 0;
 }
 
-PVE::RPCEnvironment->setup_default_cli_env();
-my $rpcenv = PVE::RPCEnvironment::get();
+sub run_security {
+    return 0 if !PVE::UpdateManager::SecScan::is_due($settings);
 
-# Stamped BEFORE the work starts. A dist-upgrade can outlive the next few timer
-# ticks, and a schedule that stamps itself afterwards would start a second run on
-# top of the first.
-PVE::UpdateManager::Config::mark_schedule_run($nodename);
+    if (PVE::UpdateManager::SecScan::busy()) {
+        syslog('info', "security check is due but the previous one is still running - waiting");
+        return 0;
+    }
 
-my $count = scalar(@$targets);
-my $mode = $settings->{schedule_parallel} ? 'parallel' : 'serial';
-syslog('info', "starting scheduled update of $count target(s), $mode");
+    my $rpcenv = cli_env();
+    # background, for the reason given at the update's fork_worker above.
+    my $upid = eval {
+        $rpcenv->fork_worker('updmgrscan', $nodename, 'root@pam',
+            sub { PVE::UpdateManager::SecReact::worker($nodename) }, 1);
+    };
+    if (my $err = $@) {
+        syslog('err', "unable to start the security check: $err");
+        return 1;
+    }
+    syslog('info', "started security check $upid");
 
-# ONE worker for the whole run, in both modes. A parallel run is a parallel run
-# inside that worker - it starts everything sharing an update-order number at
-# once and waits for the position to finish before the next one - so the two
-# modes differ in one flag in $opts and in nothing here.
-#
-# It used to be one worker per target in parallel mode. Two things were wrong
-# with that and neither was visible from here: the update order did nothing,
-# because no worker ever saw more than one target to put in an order; and nothing
-# knew when the run as a whole was over, which is what a notification about it
-# needs.
-#
-# The 5th argument to fork_worker is `$background`, and leaving it out was a
-# silent bug: PVE::RESTEnvironment computes
-#
-#     my $sync = ($self->{type} eq 'cli' && !$background) ? 1 : 0;
-#
-# and setup_default_cli_env() builds a 'cli' environment - so the call ran
-# SYNCHRONOUSLY. "started $upid" was then logged after the run had already
-# finished, and the timer's oneshot service stayed active for the whole thing.
-my $upid = eval {
-    $rpcenv->fork_worker(
-        'updatemgr',
-        $nodename,
-        'root@pam',
-        sub { PVE::UpdateManager::Job::run_all($targets, $settings->{timeout}, $opts) },
-        1,    # background
-    );
-};
-if (my $err = $@) {
-    syslog('err', "unable to start the scheduled update: $err");
-    exit 1;
+    return 0;
 }
-syslog('info', "started $upid");
 
-# With $background set, fork_worker returns as soon as the worker exists. Waiting
-# here would hold the timer's oneshot service open for the length of a
-# dist-upgrade.
-exit 0;
+my $rc = run_schedule();
+my $rc_sec = run_security();
+
+exit($rc || $rc_sec);

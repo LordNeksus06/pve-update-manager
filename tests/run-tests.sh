@@ -7,7 +7,8 @@
 #
 #   perl unit tests   the modules against the stubs in tests/stubs - path
 #                     building, interpreter selection, the shape of the task log
-#   web interface     the REAL js/pve-update-manager.js, loaded into a V8 context
+#   web interface     the REAL js/pve-update-manager.js - built from js/src by
+#                     make, the same file the package ships - loaded into a V8 context
 #                     with a stub ExtJS - what it decides, without a browser
 #   hook tests        the REAL tools/pve-update-manager-hooks, run against copies
 #                     of a real index.html.tpl, a real taint-mode pvedaemon and a
@@ -21,6 +22,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 HOOKS="$REPO_ROOT/tools/pve-update-manager-hooks"
+
+# The interface tests load js/pve-update-manager.js, which make builds from the
+# parts under js/src. Brought up to date here too, so a run started without make
+# tests the parts as they are and not whatever bundle an earlier build left.
+make -s --no-print-directory js/pve-update-manager.js >/dev/null
 
 failures=0
 checks=0
@@ -62,6 +68,90 @@ line_of() {
     grep -nEm1 -- "$pattern" "$file" 2>/dev/null | cut -d: -f1 || true
 }
 
+# ── no file over the ceiling ────────────────────────────────────────────────
+#
+# 500 lines per file is the target and 1000 the hard ceiling (#21). Only the
+# ceiling is enforced here: a guard on the target would start red, and a guard
+# that is red on a healthy tree gets switched off. What stands above the target
+# is tracked in issues instead.
+#
+# Every tracked TEXT file, not a list of extensions - a ceiling that skips a
+# kind of file skips the one that grows. Binary files (the screenshots) have no
+# lines to count and are left out by grep -I.
+#
+# An exception names the issue that deals with it, and an exception for a file
+# that is no longer over the ceiling is an error as well: a list that keeps
+# stale entries stops meaning anything.
+SIZE_CEILING=1000
+SIZE_EXCEPTIONS=(
+    # "path/to/file #NN"
+)
+
+# size_violations <ceiling> <exception...> - reads file paths on stdin, prints one
+# line per violation, and returns how many it found.
+size_violations() {
+    local ceiling="$1"
+    shift
+    local -A excepted=()
+    local entry path lines found=0 seen=0
+    for entry in "$@"; do
+        excepted["${entry% *}"]="${entry##* }"
+    done
+    while IFS= read -r path; do
+        if [ ! -f "$path" ] || ! grep -Iq . "$path"; then
+            continue
+        fi
+        seen=$((seen + 1))
+        lines="$(wc -l < "$path")"
+        if [ "$lines" -gt "$ceiling" ] && [ -z "${excepted[$path]:-}" ]; then
+            echo "$path has $lines lines, over the ceiling of $ceiling"
+            found=$((found + 1))
+        elif [ "$lines" -le "$ceiling" ] && [ -n "${excepted[$path]:-}" ]; then
+            echo "$path is listed as oversized (${excepted[$path]}) but has only $lines lines - drop the entry"
+            found=$((found + 1))
+        fi
+    done
+    echo "checked=$seen"
+    return "$found"
+}
+
+echo "== file size"
+# The guard watched failing first, on files it makes itself: one over the
+# ceiling, and an exception for one that is not. A check nobody has seen go red
+# is a check nobody knows the shape of.
+size_dir="$(mktemp -d)"
+seq 1 1001 > "$size_dir/over.txt"
+seq 1 10 > "$size_dir/under.txt"
+if out="$(printf '%s\n' "$size_dir/over.txt" "$size_dir/under.txt" \
+        | size_violations "$SIZE_CEILING" "$size_dir/under.txt #0")"; then
+    bad "the size guard flags a file over the ceiling and a stale exception (it flagged nothing)"
+elif grep -q 'over.txt has 1001 lines' <<< "$out" && grep -q 'under.txt is listed as oversized' <<< "$out"; then
+    ok "the size guard flags a file over the ceiling and a stale exception"
+else
+    bad "the size guard flags a file over the ceiling and a stale exception"
+    # shellcheck disable=SC2001  # indenting every line of a captured block
+    echo "$out" | sed 's/^/       /'
+fi
+rm -rf "$size_dir"
+
+if git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    if out="$(git -C "$REPO_ROOT" ls-files | size_violations "$SIZE_CEILING" "${SIZE_EXCEPTIONS[@]}")"; then
+        # And it really looked: a broken file list would pass with nothing checked.
+        seen="$(sed -n 's/^checked=//p' <<< "$out")"
+        if [ "${seen:-0}" -ge 50 ]; then
+            ok "no tracked file is over $SIZE_CEILING lines ($seen text files checked)"
+        else
+            bad "the size guard checked only ${seen:-0} files - is the file list broken?"
+        fi
+    else
+        bad "no tracked file is over $SIZE_CEILING lines"
+        # shellcheck disable=SC2001  # indenting every line of a captured block
+        grep -v '^checked=' <<< "$out" | sed 's/^/       /'
+    fi
+else
+    echo "  SKIP file size: not a git checkout, so there is no list of tracked files"
+fi
+
 # A test that drives a run has to say where its cgroup is.
 #
 # PVE::UpdateManager::Job moves its worker out of the control group of the daemon
@@ -74,6 +164,15 @@ line_of() {
 # So each test that touches Job points CGROUP_FILE at a file that does not exist.
 # Checked rather than remembered: the two tests that needed it did not have it,
 # and the next one to be written would not have it either.
+# #47: an Ubuntu guest's security list is verified on the node against
+# Ubuntu's archive key; without ubuntu-keyring on the node it stays "source
+# unreachable" (measured on PVE 9.2.4). Recommends, as the owner decided on
+# 2026-10-23 - installed by default, still removable.
+echo "== package metadata"
+check "the package recommends ubuntu-keyring, so Ubuntu guests can be checked" \
+    grep -qE '^Recommends:(.*[ ,])?ubuntu-keyring([ ,(]|$)' "$REPO_ROOT/packaging/debian/control.in"
+echo
+
 echo "== perl unit tests"
 for t in tests/perl/*.t; do
     grep -q 'UpdateManager::Job' "$t" || continue
@@ -89,6 +188,57 @@ for t in tests/perl/*.t; do
         ok "$t"
     else
         bad "$t"
+        # shellcheck disable=SC2001  # indenting every line of a captured block
+        echo "$out" | sed 's/^/       /'
+    fi
+done
+
+# pvedaemon runs with -T, pvesh and these tests do not. A check started from
+# the web UI failed for every source on PVE 9.2.4 ("Insecure dependency in
+# mkdir") while the same check through pvesh worked (#40/#37). So the parts
+# that turn a guest's data into paths run here under -T as well, with input
+# that is really tainted. The glob is the list: a new file needs no entry.
+echo
+echo "== taint mode, as pvedaemon runs"
+for t in tests/taint/*.t; do
+    if out="$(perl -T -I tests/stubs -I perl "$t" 2>&1)"; then
+        ok "$t (perl -T)"
+    else
+        bad "$t (perl -T)"
+        # shellcheck disable=SC2001  # indenting every line of a captured block
+        echo "$out" | sed 's/^/       /'
+    fi
+done
+
+# Code that prefers JSON::XS and falls back to JSON::PP runs on two backends
+# that encode differently: JSON::XS writes a scalar last used as a string as a
+# JSON string, JSON::PP writes it as a number once it was used as one. So a
+# test can pass under one and fail under the other - measured (#50): with the
+# "0 +" that stores max_age as a number removed, sec-severity.t turns red under
+# JSON::XS 4.04 (PVE) and stays green under JSON::PP 4.16. The loop above runs
+# whichever is installed; this block adds the other one. The glob is the list.
+echo
+echo "== JSON backends"
+if xs_err="$(perl -MJSON::XS -e 1 2>&1)"; then
+    xs_note="JSON::XS in the run above"
+else
+    xs_note=""
+    echo "  SKIP JSON::XS: not loadable here, the run above used JSON::PP (apt install libjson-xs-perl):"
+    echo "$xs_err" | head -1 | sed 's/^/       /'
+fi
+json_tests="$(grep -l 'JSON::XS' perl/PVE/UpdateManager/*.pm | xargs -n1 basename | sed 's/\.pm$//' \
+    | while read -r m; do grep -l "UpdateManager::$m\b" tests/perl/*.t; done | sort -u)"
+# A floor: an empty list would make this block pass by running nothing.
+if [ -n "$json_tests" ]; then
+    ok "found the tests of the modules that prefer JSON::XS"
+else
+    bad "no test found for a module that prefers JSON::XS - the backend run would check nothing"
+fi
+for t in $json_tests; do
+    if out="$(perl -I tests/no-json-xs -I tests/stubs -I perl "$t" 2>&1)"; then
+        ok "$t under JSON::PP${xs_note:+ ($xs_note)}"
+    else
+        bad "$t under JSON::PP"
         # shellcheck disable=SC2001  # indenting every line of a captured block
         echo "$out" | sed 's/^/       /'
     fi
@@ -152,17 +302,23 @@ echo "== settings reach the dialog"
 # LC_ALL=C on both sides: perl sorts bytes and `sort` follows the locale, and
 # comm refuses two lists that were ordered by different rules.
 schema_keys="$(perl -I tests/stubs -I perl -e '
-    use PVE::UpdateManager::Config;
-    my $s = PVE::UpdateManager::Config::settings_schema();
+    use PVE::UpdateManager::Settings;
+    my $s = PVE::UpdateManager::Settings::settings_schema();
     print join("\n", sort keys %$s), "\n";
 ' | LC_ALL=C sort)"
 # What the window sends: commonParams(), plus the two the two modes add
-# themselves - the ticked containers and the host tick.
+# themselves - the ticked containers and the host tick - plus the `key:` lines
+# of the security table (#45), but only while commonParams() still walks that
+# table: a table nothing sends from would otherwise pass for sixteen settings.
+common_params="$(awk '/commonParams: function/,/^    },/' js/pve-update-manager.js)"
 dialog_keys="$(
     {
-        awk '/commonParams: function/,/^    },/' js/pve-update-manager.js \
-            | sed -n 's/^ *\([a-z_]*\): me\.down.*/\1/p'
+        echo "$common_params" | sed -n 's/^ *\([a-z_]*\): me\.down.*/\1/p'
         printf 'schedule_host\nschedule_vmids\n'
+        if grep -q 'PVE\.updmgr\.securityParams(me)' <<< "$common_params"; then
+            awk '/^PVE\.updmgr\.SECURITY_FIELDS = \[/,/^\];/' js/pve-update-manager.js \
+                | sed -n "s/^ *key: '\([a-z_]*\)',.*/\1/p"
+        fi
     } | LC_ALL=C sort -u
 )"
 missing="$(comm -23 <(echo "$schema_keys") <(echo "$dialog_keys"))"
@@ -208,8 +364,27 @@ if out="$(perl -I tests/stubs -I perl -e '
     # the {{#each}} blocks.
     my %row = map { $_ => 1 } keys %{ $report->{"failed-targets"}->[0] };
 
+    # The security notification (#42) has its own templates and its own data:
+    # what SecReact::report returns for one target with one package, its rows
+    # being the target block and the package inside it.
+    require PVE::UpdateManager::SecReact;
+    my ($sec) = PVE::UpdateManager::SecReact::report([{ type => "lxc", id => "101", name => "x",
+        pending => [{ name => "openssl", arch => "amd64", installed => "1", fixed => "2", urgency => "high" }],
+        warning => "w" }]);
+    my %sec_known = (map({ $_ => 1 } qw(hostname fqdn cluster-name)), map({ $_ => 1 } keys %$sec));
+    my %sec_row = map { $_ => 1 } (keys %{ $sec->{targets}->[0] }, keys %{ $sec->{targets}->[0]->{packages}->[0] });
+
+    # NOT FIXED (#73): its own templates and its own data.
+    my $unf = PVE::UpdateManager::SecReact::unfixed_report([{ desc => "CT 101 (x)",
+        facts => { not_fixed => "openssl 1, expected >= 2", not_fixed_count => 1 } }]);
+    my %unf_known = (map({ $_ => 1 } qw(hostname fqdn cluster-name)), map({ $_ => 1 } keys %$unf));
+    my %unf_row = map { $_ => 1 } keys %{ $unf->{targets}->[0] };
+
     my $bad = 0;
     for my $file (glob("packaging/notification-templates/*.hbs")) {
+        my ($k, $r) = $file =~ m/-security-unfixed-/ ? (\%unf_known, \%unf_row)
+            : $file =~ m/-security-/ ? (\%sec_known, \%sec_row)
+            : (\%known, \%row);
         open(my $fh, "<", $file) or die "cannot read $file - $!";
         local $/ = undef;
         my $raw = <$fh>;
@@ -236,13 +411,13 @@ if out="$(perl -I tests/stubs -I perl -e '
             if ($ref =~ s/\Athis\.//) {
                 print "$file: row field {{this.$ref}} is in no table column\n"
                     and $bad++
-                    if !$row{$ref};
+                    if !$r->{$ref};
                 next;
             }
 
             my ($base) = split(/\./, $ref);
             print "$file: {{$ref}} is data nothing puts in the notification\n" and $bad++
-                if !$known{$base};
+                if !$k->{$base};
         }
     }
 
@@ -259,7 +434,9 @@ fi
 # a body from a template NAME, and a name with no files behind it is a
 # notification that fails to render at the moment it is needed. All three,
 # because upstream ships all three for every one of its own templates.
-for part in subject.txt body.txt body.html; do
+for part in subject.txt body.txt body.html \
+    security-subject.txt security-body.txt security-body.html \
+    security-unfixed-subject.txt security-unfixed-body.txt security-unfixed-body.html; do
     if [ -f "$REPO_ROOT/packaging/notification-templates/pve-update-manager-$part.hbs" ]; then
         ok "the $part template is there"
     else
@@ -485,6 +662,59 @@ if cmp -s "$WORK/stranger.orig" "$WORK/stranger"; then
     ok "and leaves the file untouched"
 else
     bad "and leaves the file untouched"
+fi
+
+# ── a step of apply that fails stops the edit (#61) ─────────────────────────
+#
+# apply_perl_target runs inside `apply_perl_target || rc=1`, where `set -e` is
+# suspended. A failed backup copy used to be walked past, and when the patched
+# file then did not compile, the restore put back whatever an EARLIER apply had
+# saved - the pvedaemon of a previous pve-manager. The failing commands are
+# stubs on PATH so that this also holds when the suite runs as root, which
+# writes through a read-only file.
+FAILBIN="$WORK/failbin"
+mkdir -p "$FAILBIN"
+printf '#!/bin/sh\nexit 1\n' > "$FAILBIN/fail"
+chmod 0755 "$FAILBIN/fail"
+
+STALE="$WORK/stale"
+mkdir -p "$STALE/backup"
+cp -a "$WORK/pristine/pvedaemon" "$STALE/pvedaemon"
+echo 'this is not perl(' >> "$STALE/pvedaemon"
+cp -a "$STALE/pvedaemon" "$STALE/pvedaemon.before"
+printf '#!/usr/bin/perl -T\n# stale copy from an older pve-manager\n' \
+    > "$STALE/backup/${STALE//\//_}_pvedaemon"
+ln -sf "$FAILBIN/fail" "$FAILBIN/cp"
+
+if PATH="$FAILBIN:$PATH" PVEUM_PERL_TARGETS="$STALE/pvedaemon" PVEUM_BACKUP_DIR="$STALE/backup" \
+    bash "$HOOKS" apply --quiet >/dev/null 2>&1; then
+    bad "apply fails when the backup cannot be taken"
+else
+    ok "apply fails when the backup cannot be taken"
+fi
+if cmp -s "$STALE/pvedaemon.before" "$STALE/pvedaemon"; then
+    ok "and leaves pvedaemon as it was instead of putting an older backup in its place"
+else
+    bad "and leaves pvedaemon as it was instead of putting an older backup in its place"
+fi
+rm -f "$FAILBIN/cp"
+
+# A failed chmod used to be followed by the mv all the same: pvedaemon replaced
+# by a mktemp file with mode 0600, which systemd cannot execute.
+cp -a "$WORK/pristine/pvedaemon" "$STALE/plain"
+ln -sf "$FAILBIN/fail" "$FAILBIN/chmod"
+PATH="$FAILBIN:$PATH" PVEUM_PERL_TARGETS="$STALE/plain" PVEUM_BACKUP_DIR="$STALE/backup" \
+    bash "$HOOKS" apply --quiet >/dev/null 2>&1 || true
+rm -f "$FAILBIN/chmod"
+if cmp -s "$WORK/pristine/pvedaemon" "$STALE/plain" && [ -x "$STALE/plain" ]; then
+    ok "a failed chmod leaves pvedaemon executable and untouched"
+else
+    bad "a failed chmod leaves pvedaemon executable and untouched"
+fi
+if compgen -G "$STALE/plain.pveum.*" >/dev/null; then
+    bad "and no temp file is left beside it"
+else
+    ok "and no temp file is left beside it"
 fi
 
 # ── packaging: the maintainer scripts must keep the timer's books straight ──

@@ -116,7 +116,10 @@ insert_line() {
         return 1
     }
 
-    chmod --reference="$file" "$tmp"
+    # Checked, and not left to `set -e`: every caller sits in an `||` list,
+    # where `set -e` is suspended, so a failed chmod would be walked past and
+    # the mv below would put a 0600 mktemp file in place of /usr/bin/pvedaemon.
+    chmod --reference="$file" "$tmp" || { rm -f "$tmp"; return 1; }
     mv "$tmp" "$file"
 }
 
@@ -141,13 +144,14 @@ remove_hook_line() {
         return 1
     fi
 
-    chmod --reference="$file" "$tmp"
+    # Checked for the reason given in insert_line.
+    chmod --reference="$file" "$tmp" || { rm -f "$tmp"; return 1; }
     mv "$tmp" "$file"
 }
 
 save_backup() {
     local file="$1"
-    mkdir -p "$BACKUP_DIR"
+    mkdir -p "$BACKUP_DIR" || return 1
     cp -a "$file" "$(backup_of "$file")"
 }
 
@@ -220,7 +224,8 @@ apply_tpl() {
         return 0
     fi
 
-    save_backup "$TPL"
+    # No backup taken now, no edit: see apply_perl_target.
+    save_backup "$TPL" || { warn "could not back up $TPL - leaving it alone"; return 1; }
     # Explicit `|| return`: cmd_apply calls this in an `||` list, and inside such
     # a call `set -e` is suspended - a bare failing command would be walked past
     # and the function would report success.
@@ -237,7 +242,11 @@ apply_perl_target() {
         return 0
     fi
 
-    save_backup "$file"
+    # No backup taken now, no edit. A failed copy (full or read-only /var/lib)
+    # leaves whatever an EARLIER apply saved - the file of a previous
+    # pve-manager version - and the restore below would then put that old
+    # pvedaemon in place of the current one. Measured with the fixtures (#61).
+    save_backup "$file" || { warn "could not back up $file - leaving it alone"; return 1; }
     # BEFORE the entry-point module: BEGIN blocks run in textual order, so this
     # is what makes the routes exist by the time that module is imported. The
     # daemons do not care either way, so one rule covers all three.
@@ -248,7 +257,7 @@ apply_perl_target() {
     # the command line is always allowed.
     if ! perl -Tc "$file" >/dev/null 2>&1; then
         warn "patched $file does not compile - restoring the original"
-        restore_backup "$file"
+        restore_backup "$file" || warn "could not restore $file from $(backup_of "$file") - fix it by hand"
         return 1
     fi
 

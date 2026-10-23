@@ -20,10 +20,17 @@ use PVE::RESTHandler;
 use PVE::RPCEnvironment;
 use PVE::Storage;
 
+use PVE::UpdateManager::Authz;
 use PVE::UpdateManager::Config;
 use PVE::UpdateManager::Guest;
 use PVE::UpdateManager::Job;
+use PVE::UpdateManager::Logs;
 use PVE::UpdateManager::Runner;
+use PVE::UpdateManager::SecReact;
+use PVE::UpdateManager::SecSummary;
+use PVE::UpdateManager::Settings;
+use PVE::UpdateManager::Snapshot;
+use PVE::UpdateManager::Versions;
 
 use base qw(PVE::RESTHandler);
 
@@ -55,6 +62,7 @@ __PACKAGE__->register_method({
             { name => 'logs' },
             { name => 'settings' },
             { name => 'order' },
+            { name => 'security' },
         ];
     },
 });
@@ -71,7 +79,7 @@ __PACKAGE__->register_method({
 # is no cluster-wide value anywhere, only twelve nodes that were told the same
 # thing.
 
-my $settings_properties = PVE::UpdateManager::Config::settings_schema();
+my $settings_properties = PVE::UpdateManager::Settings::settings_schema();
 
 __PACKAGE__->register_method({
     name => 'get_settings',
@@ -114,7 +122,7 @@ __PACKAGE__->register_method({
     code => sub {
         my ($param) = @_;
 
-        my $settings = PVE::UpdateManager::Config::load_settings($param->{node});
+        my $settings = PVE::UpdateManager::Settings::load_settings($param->{node});
 
         my $res = { %$settings };
 
@@ -122,7 +130,7 @@ __PACKAGE__->register_method({
             # From now, not from last_run: this answers "when will it next fire",
             # and a schedule that is already overdue would otherwise report a
             # time in the past.
-            my $next = PVE::UpdateManager::Config::next_schedule_run($settings, time());
+            my $next = PVE::UpdateManager::Settings::next_schedule_run($settings, time());
             $res->{next_run} = $next if defined($next);
         }
 
@@ -144,11 +152,14 @@ __PACKAGE__->register_method({
             warn "pve-update-manager: cannot read the storage configuration: $err\n";
         }
 
-        my $list = eval { PVE::LXC::config_list() } || {};
-        for my $vmid (keys %$list) {
-            next if !PVE::UpdateManager::Runner::can_snapshot($vmid, $storecfg);
-            $res->{snapshot_capable} = 1;
-            last;
+        # VMs count too: they are snapshotted with the same settings.
+        GUEST: for my $type (@PVE::UpdateManager::Guest::TYPES) {
+            my $list = eval { PVE::UpdateManager::Guest::config_list($type) } || {};
+            for my $vmid (keys %$list) {
+                next if !PVE::UpdateManager::Snapshot::can_snapshot($vmid, $storecfg);
+                $res->{snapshot_capable} = 1;
+                last GUEST;
+            }
         }
 
         return $res;
@@ -163,9 +174,10 @@ __PACKAGE__->register_method({
     proxyto => 'node',
     description => "Set the node's update manager settings.",
     permissions => {
-        description => "A schedule runs the stored commands as root, on the node and inside"
-            . " containers, without anybody watching - so it needs the privilege that"
-            . " running them by hand needs.",
+        description => "Sys.Console on /nodes/{node}. A save that changes anything also needs"
+            . " what the node will then run unattended: for every scheduled or immediately"
+            . " updated guest the privileges a run of it needs, and root\@pam when the host"
+            . " script is scheduled or immediate updates cover every target (#63, #65).",
         check => ['perm', '/nodes/{node}', ['Sys.Console']],
     },
     parameters => {
@@ -182,7 +194,12 @@ __PACKAGE__->register_method({
 
         my $node = delete $param->{node};
 
-        PVE::UpdateManager::Config::save_settings($node, $param);
+        my $rpcenv = PVE::RPCEnvironment::get();
+        PVE::UpdateManager::Authz::check_settings_save(
+            $rpcenv, $rpcenv->get_user(), PVE::UpdateManager::Settings::load_settings($node), $param,
+        );
+
+        PVE::UpdateManager::Settings::save_settings($node, $param);
 
         return undef;
     },
@@ -235,11 +252,12 @@ __PACKAGE__->register_method({
                 snapshot_shutdown => {
                     type => 'boolean',
                     optional => 1,
-                    description => "Node rows only: whether a container on this node is shut"
+                    description => "Node rows only: whether a container or VM on this node is shut"
                         . " down for its snapshot. The confirmation dialog says so out loud,"
                         . " because it is downtime nobody asked for at the moment of clicking.",
                 },
                 %{ PVE::UpdateManager::Config::last_run_schema() },
+                %{ PVE::UpdateManager::SecSummary::row_schema() },
             },
         },
     },
@@ -250,13 +268,18 @@ __PACKAGE__->register_method({
         my $rpcenv = PVE::RPCEnvironment::get();
         my $authuser = $rpcenv->get_user();
 
+        # The security check's results (#41), from the one summary file the
+        # background round writes - read once here, never a guest touched:
+        # this is an API call, and the web UI waits on it (#35).
+        my $sec = PVE::UpdateManager::SecSummary::load($node);
+
         my $res = [];
 
         # The host goes first so it is where the eye lands, but the UI leaves it
         # unticked - Proxmox has its own updater for the node and this row is the
         # exception, not the default.
         if ($rpcenv->check($authuser, "/nodes/$node", ['Sys.Audit'], 1)) {
-            my $settings = PVE::UpdateManager::Config::load_settings($node);
+            my $settings = PVE::UpdateManager::Settings::load_settings($node);
             push @$res, {
                 type => 'node',
                 id => $node,
@@ -268,6 +291,7 @@ __PACKAGE__->register_method({
                 snapshot_shutdown =>
                     ($settings->{snapshot_before} && $settings->{snapshot_shutdown}) ? 1 : 0,
                 %{ PVE::UpdateManager::Config::last_run('node', $node) },
+                %{ PVE::UpdateManager::SecSummary::row_fields($sec, 'node', $node) },
             };
         }
 
@@ -291,6 +315,7 @@ __PACKAGE__->register_method({
                     stored => PVE::UpdateManager::Config::has_script($type, $vmid) ? 1 : 0,
                     order => PVE::UpdateManager::Config::load_order($type, $vmid),
                     %{ PVE::UpdateManager::Config::last_run($type, $vmid) },
+                    %{ PVE::UpdateManager::SecSummary::row_fields($sec, $type, $vmid) },
                 };
             }
         }
@@ -349,6 +374,8 @@ __PACKAGE__->register_method({
     proxyto => 'node',
     description => "Store the update script of the host itself.",
     permissions => {
+        description => "root\@pam only: the script runs as root on the node, and PVE gives a"
+            . " root shell on the node to root\@pam alone (#63).",
         check => ['perm', '/nodes/{node}', ['Sys.Modify']],
     },
     parameters => {
@@ -367,6 +394,7 @@ __PACKAGE__->register_method({
         my ($param) = @_;
 
         my $rpcenv = PVE::RPCEnvironment::get();
+        PVE::UpdateManager::Authz::check_root($rpcenv->get_user(), 'the host script');
 
         PVE::UpdateManager::Config::save_script(
             'node', $param->{node}, $param->{script}, $rpcenv->get_user(),
@@ -413,7 +441,7 @@ __PACKAGE__->register_method({
     code => sub {
         my ($param) = @_;
 
-        return PVE::UpdateManager::Config::list_versions('node', $param->{node});
+        return PVE::UpdateManager::Versions::list_versions('node', $param->{node});
     },
 });
 
@@ -450,7 +478,7 @@ __PACKAGE__->register_method({
         my ($param) = @_;
 
         my $script =
-            PVE::UpdateManager::Config::load_version('node', $param->{node}, $param->{version});
+            PVE::UpdateManager::Versions::load_version('node', $param->{node}, $param->{version});
 
         raise_param_exc({ version => "no such version" }) if !defined($script);
 
@@ -545,7 +573,7 @@ __PACKAGE__->register_method({
                 log => { type => 'string', maxLength => 32 },
                 time => { type => 'integer' },
                 size => { type => 'integer' },
-                state => { type => 'string', optional => 1, enum => ['ok', 'failed', 'skipped'] },
+                state => { type => 'string', optional => 1, enum => ['ok', 'not_fixed', 'failed', 'skipped'] },
                 note => { type => 'string', optional => 1 },
                 upid => { type => 'string', optional => 1 },
             },
@@ -554,7 +582,7 @@ __PACKAGE__->register_method({
     code => sub {
         my ($param) = @_;
 
-        return PVE::UpdateManager::Config::list_logs('node', $param->{node});
+        return PVE::UpdateManager::Logs::list_logs('node', $param->{node});
     },
 });
 
@@ -588,7 +616,7 @@ __PACKAGE__->register_method({
     code => sub {
         my ($param) = @_;
 
-        my $text = PVE::UpdateManager::Config::load_log('node', $param->{node}, $param->{log});
+        my $text = PVE::UpdateManager::Logs::load_log('node', $param->{node}, $param->{log});
 
         raise_param_exc({ log => "no such run log" }) if !defined($text);
 
@@ -605,8 +633,10 @@ __PACKAGE__->register_method({
     description => "Run the update scripts of the selected targets in one task."
         . " Returns the UPID of that task.",
     permissions => {
-        description => "Checked per target: VM.Console on /vms/{vmid} for every guest,"
-            . " Sys.Console on /nodes/{node} when the host is included.",
+        description => "Checked per target: for every guest what a run of it needs with the"
+            . " node's settings - VM.Console, and VM.Snapshot, VM.Snapshot(.Rollback) or"
+            . " VM.PowerMgmt where the run snapshots, rolls back or starts and stops it (#64);"
+            . " root\@pam when the host is included (#63).",
         user => 'all',
     },
     parameters => {
@@ -646,27 +676,27 @@ __PACKAGE__->register_method({
         # The settings are the default, not a hardcoded hour: the limit now kills
         # the process tree, so whoever owns the node has to be able to see it and
         # move it.
-        my $settings = PVE::UpdateManager::Config::load_settings($node);
+        my $settings = PVE::UpdateManager::Settings::load_settings($node);
         my $timeout = $param->{timeout} // $settings->{timeout};
         # The node's own switch decides whether the selection is walked one at a
         # time or a position at a time - not the caller. It used to be the caller:
         # the web interface sent one request per target for a parallel run, which
         # is why the update order did nothing there and why nothing knew when the
         # whole run was over.
-        my $opts = PVE::UpdateManager::Config::run_opts(
+        my $opts = PVE::UpdateManager::Settings::run_opts(
             $settings, $settings->{parallel_manual}, $settings->{parallel_manual_max},
         );
 
         my $targets = [];
 
         if ($param->{host}) {
-            $rpcenv->check($authuser, "/nodes/$node", ['Sys.Console']);
+            PVE::UpdateManager::Authz::check_root($authuser, 'the host script');
             push @$targets, { type => 'node', id => $node, name => $node };
         }
 
         if (defined($param->{vmids}) && length($param->{vmids})) {
             for my $vmid (split(/,/, $param->{vmids})) {
-                $rpcenv->check($authuser, "/vms/$vmid", ['VM.Console']);
+                PVE::UpdateManager::Authz::check_guest_run($rpcenv, $authuser, "/vms/$vmid", $settings);
                 push @$targets, PVE::UpdateManager::Guest::target($vmid);
             }
         }
@@ -678,6 +708,58 @@ __PACKAGE__->register_method({
         };
 
         return $rpcenv->fork_worker('updatemgr', $node, $authuser, $realcmd);
+    },
+});
+
+# ── the security check (#40, #41) ───────────────────────────────────────────
+
+__PACKAGE__->register_method({
+    name => 'security_index',
+    path => 'security',
+    method => 'GET',
+    permissions => { user => 'all' },
+    description => "Security check index.",
+    parameters => {
+        additionalProperties => 0,
+        properties => { node => get_standard_option('pve-node') },
+    },
+    returns => {
+        type => 'array',
+        items => { type => 'object', properties => {} },
+        links => [{ rel => 'child', href => '{name}' }],
+    },
+    code => sub { return [{ name => 'scan' }] },
+});
+
+__PACKAGE__->register_method({
+    name => 'security_scan',
+    path => 'security/scan',
+    method => 'POST',
+    protected => 1,
+    proxyto => 'node',
+    description => "Check this node's targets for pending security updates now, in a"
+        . " background task. Returns its UPID at once; when another check is still"
+        . " running, the task says so and does nothing.",
+    permissions => {
+        description => "Sys.Console on /nodes/{node}: the check reads every guest's package"
+            . " list, and with security_install on it can start updates.",
+        check => ['perm', '/nodes/{node}', ['Sys.Console']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => { node => get_standard_option('pve-node') },
+    },
+    returns => { type => 'string' },
+    code => sub {
+        my ($param) = @_;
+
+        my $node = $param->{node};
+        my $rpcenv = PVE::RPCEnvironment::get();
+
+        # A worker task, not the work: this call returns at once whatever the
+        # guests do (#35 - pvedaemon has three workers, #36 V8).
+        return $rpcenv->fork_worker('updmgrscan', $node, $rpcenv->get_user(),
+            sub { PVE::UpdateManager::SecReact::worker($node) });
     },
 });
 

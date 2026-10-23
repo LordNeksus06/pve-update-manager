@@ -28,14 +28,13 @@ use warnings;
 use IO::Handle;
 use POSIX ();
 
-use PVE::LXC;
-use PVE::LXC::Config;
-
 use PVE::UpdateManager::Config;
 use PVE::UpdateManager::Guest;
+use PVE::UpdateManager::Logs;
 use PVE::UpdateManager::Notify;
-use PVE::UpdateManager::QemuRunner;
+use PVE::UpdateManager::QemuPower;
 use PVE::UpdateManager::Runner;
+use PVE::UpdateManager::Target;
 
 # A worker's STDOUT is the task log file itself - fork_worker points it there
 # with PVE::UPID::open_log and nothing in between counts bytes. Proxmox never
@@ -232,13 +231,26 @@ sub _human_time {
 # Never dies and never lets its own failure become the run's. The update happened
 # either way; a disk that is full is worth a line in the syslog and not a target
 # reported as failed for something that has nothing to do with it.
+# The word a run ends with, for the run log's header and for the summary - one
+# function, so the two cannot disagree. NOT FIXED (#73): the script exited 0,
+# but security updates pending before the run are still not installed - red,
+# no rollback, and not a FAILED.
+sub _verdict {
+    my ($rc, $facts) = @_;
+
+    return 'SKIPPED' if !defined($rc);
+    return 'FAILED' if $rc != 0;
+    return 'NOT FIXED' if ($facts // {})->{not_fixed_count};
+    return 'OK';
+}
+
 sub _store_log {
     my ($target, $upid, $facts, $rc, $note, $lines, $opts) = @_;
 
     my $keep = $opts->{run_logs};
     return if !defined($keep) || $keep < 1;
 
-    my $state = !defined($rc) ? 'SKIPPED' : $rc == 0 ? 'OK' : 'FAILED';
+    my $state = _verdict($rc, $facts);
 
     my $header = join(
         "\n",
@@ -256,7 +268,7 @@ sub _store_log {
     );
 
     eval {
-        PVE::UpdateManager::Config::save_log(
+        PVE::UpdateManager::Logs::save_log(
             $target->{type},
             $target->{id},
             $header . join("\n", @{ $lines // [] }) . "\n",
@@ -298,629 +310,6 @@ sub skip_no_script {
     return $NO_SCRIPT_NOTE;
 }
 
-# Returns (exit_code, note). exit_code 0 means the script ran and succeeded;
-# `undef` means the target was skipped and never ran, which the summary reports
-# separately from a failure so "stopped" does not look like "broken".
-sub run_one {
-    my ($target, $timeout, $upid, $opts) = @_;
-
-    $opts //= {};
-    my $started = time();
-
-    # The facts behind the note, one field each.
-    #
-    # The note is a sentence, for the row and the task log. A sentence is the
-    # wrong shape for anything that has to say WHICH snapshot, or WHETHER it was
-    # rolled back, on a line of its own - which is what the failure notification
-    # is asked for. So the pieces are collected here as they happen and handed
-    # back beside the note rather than parsed back out of it: a report that
-    # regexes its own log is a report that breaks the day the wording improves.
-    my $facts = { started => $started };
-
-    # What this target printed, kept for the log below. Local, so it ends at every
-    # one of this function's exits by itself.
-    my @captured;
-    local $CAPTURE = ($opts->{run_logs} // 0) > 0 ? \@captured : undef;
-
-    # Every exit from run_one goes through this, so no caller has to guess when a
-    # target stopped or how long it took - including the exits that stop before
-    # anything ran, where the answer is "no time at all" rather than "unknown".
-    #
-    # It is also the one place that writes this target's log, for the same reason:
-    # eleven exits mean eleven chances to forget, and a run that reports an
-    # outcome without leaving the log of it is the one this feature exists to
-    # prevent.
-    my $stop = sub {
-        my ($rc, $note) = @_;
-
-        $facts->{finished} //= time();
-        $facts->{elapsed} //= $facts->{finished} - $started;
-
-        _store_log($target, $upid, $facts, $rc, $note, \@captured, $opts);
-
-        return $facts;
-    };
-
-    my ($script) = PVE::UpdateManager::Config::load_script($target->{type}, $target->{id});
-    if (!defined($script) || $script !~ m/\S/) {
-        my $skip = skip_no_script($target, $upid, $started);
-                return (undef, $skip, $stop->(undef, $skip));
-    }
-
-    # A container whose config is not on this node is not ours to update. It has
-    # been migrated away since the list was built, or the vmid names a VM, or a
-    # scheduled list still carries one that has moved - and the scripts live in
-    # /etc/pve, which is the same everywhere, so the stored commands are found
-    # either way and nothing further down would notice.
-    #
-    # Without this the answer is check_running()'s "container is not running":
-    # true, because it looks for a cgroup this node does not have, and wrong,
-    # because the container is running perfectly well somewhere else. On a
-    # schedule that is the same misleading line every night, and starting it -
-    # which is what the note invites - fails for a reason that names no cause.
-    my $guest = PVE::UpdateManager::Guest::is_guest_type($target->{type});
-    my $vm = $target->{type} eq 'qemu';
-    my $noun = PVE::UpdateManager::Guest::noun($target->{type});
-
-    my $conf = $guest
-        ? eval { PVE::UpdateManager::Guest::load_config($target->{type}, $target->{id}) }
-        : undef;
-
-    if ($guest && !$conf) {
-        my $note = "not a $noun on this node";
-        _set_state(
-            $target,
-            {
-                state => 'skipped', upid => $upid, started => $started,
-                finished => time(), note => $note,
-            },
-        );
-        return (undef, $note, $stop->(undef, $note));
-    }
-
-    # A template is not a container that happens to be switched off. PVE refuses
-    # to start one ("you can't start a CT if it's a template") and refuses to
-    # snapshot one ("you can't take a snapshot if it's a template"), both read
-    # off its own source - so with 'start stopped containers' on, a template in
-    # the selection came out as a FAILED target rather than as one there was
-    # never anything to do for. Select All picks them up, which is how it gets
-    # into a run in the first place.
-    if ($conf && PVE::UpdateManager::Guest::is_template($target->{type}, $conf)) {
-        my $note = "this is a template, not a $noun";
-        _set_state(
-            $target,
-            {
-                state => 'skipped', upid => $upid, started => $started,
-                finished => time(), note => $note,
-            },
-        );
-        return (undef, $note, $stop->(undef, $note));
-    }
-
-    # A stopped container is skipped, and that stays the default: starting one
-    # somebody deliberately stopped runs its services and its cron for as long
-    # as the update takes, which is not a decision an update tool gets to make
-    # on its own. The node's settings are where it can be granted.
-    my $stopped = $guest && !PVE::UpdateManager::Guest::is_running($target->{type}, $target->{id});
-
-    # Starting a stopped VM is not built yet - it needs a boot, a wait for the
-    # guest agent and a shutdown that PVE does differently for VMs - so a VM
-    # that is off is skipped whatever the setting says, and the row says why
-    # rather than pretending the setting was not on.
-    if ($stopped && (!$opts->{start_stopped} || $vm)) {
-        my $note = "$noun is not running";
-        $note .= " - starting stopped VMs for their update is not supported yet"
-            if $vm && $opts->{start_stopped};
-        _set_state(
-            $target,
-            {
-                state => 'skipped', upid => $upid, started => $started,
-                finished => time(), note => $note,
-            },
-        );
-        return (undef, $note, $stop->(undef, $note));
-    }
-
-    # A VM is reached through its guest agent and nothing else. Without one the
-    # update did not happen, and that is a FAILURE, not a skip - the owner's
-    # call: a VM that silently never gets updated is the outcome to avoid, and a
-    # skip sends no notification.
-    #
-    # Asked before the row is claimed, so a VM without an agent does not flash
-    # a spinner for the three seconds the ping takes.
-    if ($vm) {
-        my $missing = !PVE::UpdateManager::Guest::agent_enabled($conf)
-            ? 'the QEMU guest agent is not enabled in the options of this VM'
-            : !PVE::UpdateManager::QemuRunner::agent_running($target->{id})
-            ? 'the QEMU guest agent is not answering - is qemu-guest-agent running inside the VM?'
-            : undef;
-
-        if (defined($missing)) {
-            _set_state(
-                $target,
-                {
-                    state => 'failed', upid => $upid, started => $started,
-                    finished => time(), exit => -1, note => $missing,
-                },
-            );
-            return (-1, $missing, $stop->(-1, $missing));
-        }
-    }
-
-    # Written before the run, not after: this is what makes the grid show a
-    # spinner on the row while apt is still working. Claiming it under the lock
-    # is what stops a second run from starting on top of this one - two apt
-    # processes in one container fight over the dpkg lock, and the row can only
-    # point at one task log.
-    my $busy;
-    eval {
-        PVE::UpdateManager::Config::lock_target(
-            $target->{type},
-            $target->{id},
-            sub {
-                if (PVE::UpdateManager::Config::target_is_running($target->{type}, $target->{id})) {
-                    $busy = 1;
-                    return;
-                }
-                _set_state($target, { state => 'running', upid => $upid, started => $started });
-            },
-        );
-        1;
-    } or do {
-        # A lock we cannot take must not silently turn into a run we cannot
-        # account for. Refusing is the safe half of the choice.
-        $busy = 1;
-    };
-
-    # Note what is NOT done here: no state is written. The other task owns this
-    # row and is still running in it - recording our own "skipped" on top would
-    # replace a live spinner with a finished-looking result and point the row's
-    # log link at the task that did nothing.
-    if ($busy) {
-        return (
-                    undef,
-                    'already being updated by another task',
-                    $stop->(undef, 'already being updated by another task'),
-                );
-    }
-
-    my ($logfunc, $report) = _capped_logger($MAX_OUTPUT_BYTES);
-
-    # ── the rollback point ──────────────────────────────────────────────────
-    #
-    # Before the config lock below, not after: snapshot_create takes its own
-    # lock and PVE refuses one while another is held, so the guard would defeat
-    # the thing it is guarding. Before the container is started, too, when it
-    # was found stopped - the state somebody left it in is the cleaner thing to
-    # roll back to.
-    #
-    # Only where the storage really can. Where it cannot the run goes ahead
-    # exactly as it did before this setting existed: a container on a directory
-    # storage is not one to refuse to update.
-    # Asked before the snapshot and not only by lock_guest below: a container
-    # whose nightly backup overlaps the update window is skipped every single
-    # run, and snapshotting it first would leave one snapshot per attempt behind
-    # - which the pruning below cannot clear either, because removing a snapshot
-    # takes a config lock too and that is exactly what is not available.
-    #
-    # A check-then-act, deliberately. lock_guest stays the real guard; this only
-    # keeps the common case from paying for a snapshot nobody can use.
-    #
-    # A VM is asked too: a backup or a migration holds its config lock the same
-    # way, and running apt inside a VM that is being migrated away is the same
-    # mistake. Only the repairs below are container business.
-    my $foreign_lock = $guest
-        ? eval { PVE::UpdateManager::Guest::load_config($target->{type}, $target->{id})->{lock} }
-        : undef;
-
-    # A 'snapshot-delete' lock nobody has touched for ten minutes is not another
-    # task holding the container, it is the wreck of an earlier run of ours -
-    # and skipping it means skipping this container for good. Repaired here so
-    # the next update is what un-sticks it, rather than a manual `pct unlock`.
-    if (!$vm && defined($foreign_lock)
-        && $foreign_lock eq $PVE::UpdateManager::Runner::SNAPSHOT_DELETE_LOCK) {
-
-        my $wedged = PVE::UpdateManager::Runner::stale_delete_wedge($target->{id});
-        if (defined($wedged)) {
-            _log("CT $target->{id} is locked by a snapshot removal an earlier run"
-                . " did not finish - repairing it before the update");
-            PVE::UpdateManager::Runner::_repair_stuck_delete($target->{id}, $wedged, $logfunc);
-            $foreign_lock = eval { PVE::LXC::Config->load_config($target->{id})->{lock} };
-        }
-    }
-
-    if (defined($foreign_lock) && length($foreign_lock)) {
-        my $note = "another task holds the lock ($foreign_lock)";
-
-        # ... unless it is ours and nobody has touched the container since. A
-        # worker that was killed never reaches unlock_guest, and the row would
-        # otherwise say the same thing every night without ever saying what to
-        # do about it. The lock is left alone on purpose - see stale_own_lock.
-        $note .= " - nothing has touched this container in "
-            . int($PVE::UpdateManager::Runner::STALE_WEDGE_SECONDS / 60)
-            . " minutes, so this may be left over from an update that was"
-            . " interrupted; 'pct unlock $target->{id}' clears it"
-            if !$vm && PVE::UpdateManager::Runner::stale_own_lock($target->{id});
-
-        _set_state(
-            $target,
-            {
-                state => 'skipped', upid => $upid, started => $started,
-                finished => time(), note => $note,
-            },
-        );
-        return (undef, $note, $stop->(undef, $note));
-    }
-
-    my $snapshot;
-
-    # What a failed removal left behind that could not be repaired. It belongs
-    # in the row and not only in the log: a container that is still locked will
-    # refuse its next update, its next backup and its next start, and nobody
-    # reads the log of a run that reported success.
-    my $stuck = [];
-
-    # Every exit from here on has to prune, not only the one at the bottom. A run
-    # that snapshots and then returns early - the lock taken in the gap above,
-    # a container that will not start - would otherwise add one snapshot per
-    # attempt and never drop any, and snapshot_keep would quietly mean nothing.
-    my $prune = sub {
-        return if !defined($snapshot);
-
-        # The count is spelled out rather than left to prune_snapshots' own
-        # floor of one: a caller that asked for a snapshot and forgot to say how
-        # many to keep would otherwise lose every earlier one on the first run.
-        (undef, $stuck) = PVE::UpdateManager::Runner::prune_snapshots(
-            $target->{id},
-            $opts->{snapshot_keep} // $PVE::UpdateManager::Config::DEFAULT_SNAPSHOT_KEEP,
-            $logfunc,
-        );
-    };
-
-    # Snapshots of VMs are not built yet. Said in the log rather than refused:
-    # updating without one is what a container on a storage that cannot snapshot
-    # gets too, and a run that is refused for a missing feature updates nothing.
-    _log('snapshots of VMs are not supported yet - updating without one')
-        if $vm && $opts->{snapshot_before};
-
-    if ($target->{type} eq 'lxc' && $opts->{snapshot_before}) {
-        if (!PVE::UpdateManager::Runner::can_snapshot($target->{id})) {
-            _log('the storage of this container cannot snapshot - updating without one');
-        } else {
-            # A cold snapshot, if that was asked for. An LXC snapshot never
-            # carries memory - that exists for VMs only - so a running container
-            # is caught as if the power had been pulled, and a database mid
-            # transaction is snapshotted mid transaction. Stopping it first is
-            # the only way to a consistent one; it is off by default because it
-            # buys that with downtime.
-            #
-            # A container that was found stopped is already as cold as it gets
-            # and is left alone here - starting it for its update is the other
-            # setting's job, and it happens after this.
-            my $cold = $opts->{snapshot_shutdown} && !$stopped;
-
-            if ($cold) {
-                _log('shutting the container down for a consistent snapshot');
-
-                if (PVE::UpdateManager::Runner::shutdown_lxc($target->{id}, $logfunc) != 0) {
-                    # Before the update, not during it: the run is refused
-                    # rather than quietly falling back to a snapshot of a
-                    # running container, which is the thing the setting says it
-                    # will not do.
-                    my $note = 'could not be shut down for its snapshot';
-                    _set_state(
-                        $target,
-                        {
-                            state => 'failed', upid => $upid, started => $started,
-                            finished => time(), exit => -1, note => $note,
-                        },
-                    );
-                    return (-1, $note, $stop->(-1, $note));
-                }
-            }
-
-            $snapshot = eval {
-                PVE::UpdateManager::Runner::snapshot_lxc($target->{id}, $logfunc, $started);
-            };
-            my $snap_err = $@ // '';
-
-            # Back up before anything is reported, and whatever the snapshot
-            # did: a container left switched off because its snapshot failed is
-            # a worse outcome than the failure itself.
-            if ($cold) {
-                _log(
-                    defined($snapshot)
-                    ? 'snapshot taken - starting the container again'
-                    : 'the snapshot failed - starting the container again before reporting it',
-                );
-
-                if (PVE::UpdateManager::Runner::start_lxc($target->{id}, $logfunc) != 0) {
-                    my $note = 'could not be started again after its snapshot';
-                    $note .= " (and the snapshot failed too)" if !defined($snapshot);
-                    _set_state(
-                        $target,
-                        {
-                            state => 'failed', upid => $upid, started => $started,
-                            finished => time(), exit => -1, note => $note,
-                        },
-                    );
-                    $prune->();
-                    return (-1, $note, $stop->(-1, $note));
-                }
-
-                # Not fatal, exactly as when a stopped container is started for
-                # its update: a container with no network is a legitimate thing
-                # to update from a local mirror.
-                _log('WARNING: the container came back up without a default route')
-                    if !PVE::UpdateManager::Runner::wait_online($target->{id}, $logfunc);
-            }
-
-            # On the facts as soon as it exists, not only at the bottom: every
-            # early return below this point is a run that has a rollback point
-            # and has to be able to say which one.
-            $facts->{snapshot} = $snapshot if defined($snapshot);
-
-            if (!defined($snapshot)) {
-                # A failure, not a warning, and deliberately different from "the
-                # storage cannot do it": the storage said it could and then did
-                # not. The usual reason is a full thin pool, which is the exact
-                # situation where continuing into a dist-upgrade is worst.
-                my $err = $snap_err;
-                chomp($err);
-                my $note = "could not be snapshotted before the update - $err";
-                _set_state(
-                    $target,
-                    {
-                        state => 'failed', upid => $upid, started => $started,
-                        finished => time(), exit => -1, note => $note,
-                    },
-                );
-                # Nothing to give back: the config lock below has not been taken
-                # yet, which is the whole reason the snapshot happens here.
-                return (-1, $note, $stop->(-1, $note));
-            }
-        }
-    }
-
-    # Proxmox refuses to stop, shut down, reboot or migrate a locked guest -
-    # every one of those paths calls check_lock - so the lock is all it takes to
-    # keep a guest from being switched off in the middle of its own
-    # dist-upgrade. Taken after the row is claimed, given back below whatever
-    # happens. A container and a VM take different lock values - see
-    # Runner::LXC_LOCK and QemuRunner::VM_LOCK for why each is the one it is.
-    my ($lock_guest, $unlock_guest) = $vm
-        ? (\&PVE::UpdateManager::QemuRunner::lock_vm, \&PVE::UpdateManager::QemuRunner::unlock_vm)
-        : (\&PVE::UpdateManager::Runner::lock_guest, \&PVE::UpdateManager::Runner::unlock_guest);
-
-    my $locked = 0;
-    if ($guest) {
-        if (eval { $lock_guest->($target->{id}); 1 }) {
-            $locked = 1;
-        } else {
-            # set_lock refuses rather than overwriting, so this is somebody
-            # else's lock - a backup, a migration. Updating on top of that is
-            # exactly what the lock exists to prevent.
-            my $err = $@ // '';
-            chomp($err);
-            my $note = "another task holds the lock ($err)";
-            _set_state(
-                $target,
-                {
-                    state => 'skipped', upid => $upid, started => $started,
-                    finished => time(), note => $note,
-                },
-            );
-            $prune->();
-            return (undef, $note, $stop->(undef, $note));
-        }
-    }
-
-    # Started here rather than before the lock, so the row already shows a
-    # spinner while the container boots - that is part of the run's duration and
-    # a second task must not slip in during it.
-    my $we_started_it = 0;
-    if ($stopped) {
-        _log('container is stopped - starting it for the update');
-
-        if (PVE::UpdateManager::Runner::start_lxc($target->{id}, $logfunc) != 0) {
-            my $failed = time();
-            _set_state(
-                $target,
-                {
-                    state => 'failed', upid => $upid, started => $started,
-                    finished => $failed, exit => -1,
-                    note => 'could not be started for the update',
-                },
-            );
-            # A failure, not a skip: this target was asked for explicitly by
-            # turning the setting on, and it did not happen. The lock goes back
-            # on the way out - an early return that keeps it would leave the
-            # container unstoppable until somebody found `pct unlock`.
-            $unlock_guest->($target->{id}, $logfunc) if $locked;
-            $prune->();
-            return (
-                            -1,
-                            'could not be started for the update',
-                            $stop->(-1, 'could not be started for the update'),
-                        );
-        }
-
-        $we_started_it = 1;
-
-        if (!PVE::UpdateManager::Runner::wait_online($target->{id}, $logfunc)) {
-            # Not fatal. A container with no network is a legitimate thing to
-            # update from a local mirror, and guessing otherwise would refuse a
-            # run that would have worked.
-            _log('WARNING: the container came up without a default route - updating anyway');
-        }
-    }
-
-    my $rc;
-    if ($target->{type} eq 'node') {
-        $rc = PVE::UpdateManager::Runner::run_host($script, $timeout, $logfunc);
-    } elsif ($vm) {
-        $rc = PVE::UpdateManager::QemuRunner::run_vm($target->{id}, $script, $timeout, $logfunc);
-    } else {
-        $rc = PVE::UpdateManager::Runner::run_lxc($target->{id}, $script, $timeout, $logfunc);
-    }
-
-    # BEFORE the shutdown below, not after. The lock we hold is the same one PVE
-    # checks in vm_shutdown, so leaving it on would make our own attempt to put
-    # the container back fail - the guard would defeat the thing it is guarding.
-    # The update itself is over by this point, which is what the lock was for.
-    $unlock_guest->($target->{id}, $logfunc) if $locked;
-
-    # ── undoing an update that failed ───────────────────────────────────────
-    #
-    # Off by default, and it has to be: a rollback throws away everything that
-    # happened since the snapshot, not only what the update did. Fifteen minutes
-    # of a database's day go with it. Where it is switched on, it is switched on
-    # for containers whose update either works or is to be taken back whole.
-    #
-    # After the lock, never before: PVE's snapshot_rollback calls check_lock and
-    # refuses while any lock is set - ours included.
-    my $rolled_back = 0;
-    my $rollback_failed = 0;
-
-    if ($rc != 0 && defined($snapshot) && $opts->{rollback_on_failure}) {
-        _log("the update failed - rolling the container back to $snapshot");
-
-        if (eval {
-            PVE::UpdateManager::Runner::rollback_lxc(
-                $target->{id}, $snapshot, $logfunc, $opts->{rollback_remove_newer},
-            );
-            1;
-        }) {
-            $rolled_back = 1;
-
-            # PVE stops the container to roll it back and leaves it stopped -
-            # read off AbstractConfig and then watched on a real 9.2. Whatever
-            # we knew about having started it ourselves is no longer true.
-            $we_started_it = 0;
-
-            if (!$stopped) {
-                _log('rolled back - starting the container again');
-                $rollback_failed = 1
-                    if PVE::UpdateManager::Runner::start_lxc($target->{id}, $logfunc) != 0;
-                _log('WARNING: the container did not come back up after the rollback')
-                    if $rollback_failed;
-            }
-        } else {
-            my $err = $@ // '';
-            chomp($err);
-            _log("WARNING: rolling back to $snapshot failed - $err");
-            $rollback_failed = 1;
-
-            # The stop happens before the rollback itself, so one that died in
-            # the middle can leave the container off. Asked rather than assumed:
-            # starting one that is already running is an error in the log for
-            # nothing.
-            if (!$stopped && !PVE::LXC::check_running($target->{id})) {
-                _log('the container is off after the failed rollback - starting it again');
-                PVE::UpdateManager::Runner::start_lxc($target->{id}, $logfunc);
-            }
-        }
-    }
-
-    # Put back the way it was found, whatever the update did. Inside no eval
-    # because nothing above dies - run_lxc turns every failure into an exit
-    # code - and a shutdown that is skipped on a failed update would leave the
-    # container running, which is the one outcome nobody asked for.
-    my $shutdown_failed = 0;
-    if ($we_started_it) {
-        _log('update finished - putting the container back into the stopped state it was in');
-        $shutdown_failed = PVE::UpdateManager::Runner::shutdown_lxc($target->{id}, $logfunc) != 0;
-        _log('WARNING: the container could not be stopped again') if $shutdown_failed;
-    }
-
-    # After the container is back the way it was found, and after the lock is
-    # given back - snapshot_delete takes a lock of its own too. Housekeeping, so
-    # it happens whether the update worked or not: what it keeps is the NEWEST
-    # snapshots, this run's included, and a failed run is the one whose rollback
-    # point matters most.
-    $prune->();
-
-    my $finished = time();
-    my $elapsed = $finished - $started;
-
-    # 124 is what coreutils `timeout` reports when it had to stop the command,
-    # so the operator reads "timed out" instead of decoding an exit code - and
-    # the run really is over, group and all, not just no longer watched.
-    my $note = $rc == $PVE::UpdateManager::Runner::TIMEOUT_RC
-        ? "timed out after ${elapsed}s"
-        : "exit $rc after ${elapsed}s";
-
-    my $dropped = $report->();
-    $note .= ", $dropped further output line" . ($dropped == 1 ? '' : 's') . " not logged"
-        if $dropped;
-
-    # Worth the row's one line of space: a container left running when it was
-    # supposed to end up stopped is a change to the system that outlives the
-    # task log nobody reads afterwards.
-    $note .= ', but it could NOT be stopped again' if $shutdown_failed;
-
-    # The row only carries a note when there is something the exit code does not
-    # already say. "exit 0 after 4s" next to every green tick is noise; "timed
-    # out" or "output not logged" is the one case where the log alone would
-    # mislead, because it just stops.
-    # The same numbers the note is built from, so the notification and the log
-    # can never disagree about how long a target ran or when it stopped.
-    $facts->{finished} = $finished;
-    $facts->{elapsed} = $elapsed;
-    $facts->{exit} = $rc;
-    $facts->{timed_out} = ($rc == $PVE::UpdateManager::Runner::TIMEOUT_RC) ? 1 : 0;
-    $facts->{dropped} = $dropped;
-    $facts->{shutdown_failed} = $shutdown_failed ? 1 : 0;
-    $facts->{rolled_back} = $rolled_back ? 1 : 0;
-    $facts->{rollback_failed} = $rollback_failed ? 1 : 0;
-
-    my $state = {
-        state => $rc == 0 ? 'ok' : 'failed',
-        upid => $upid,
-        started => $started,
-        finished => $finished,
-        exit => $rc,
-    };
-    # The snapshot is named on the row only when the run went wrong. That is the
-    # one moment somebody needs to know which snapshot to roll back to, and it is
-    # the moment the task log is least likely to still be the thing being read.
-    # Where the run rolled back by itself, the row says THAT instead: the
-    # container is not the one the update left behind any more, and somebody
-    # reading "snapshot updmgr-..." would go and roll back to it a second time.
-    if ($rolled_back) {
-        $note .= ", rolled back to $snapshot";
-        $note .= ' - but it did NOT come back up' if $rollback_failed;
-    } elsif (defined($snapshot) && $rc != 0) {
-        $note .= ", snapshot $snapshot";
-        $note .= " - the rollback to it FAILED" if $rollback_failed;
-    }
-
-    # A snapshot PVE could neither remove nor be talked out of holding. The
-    # container may still be locked, which stops its next update as well, so it
-    # is said on the row and not left to the log.
-    my $wedged = scalar(@{ $stuck // [] });
-    $note .= ", $wedged snapshot" . ($wedged == 1 ? '' : 's') . " could NOT be removed"
-        if $wedged;
-    $facts->{stuck} = $wedged;
-
-    $state->{note} = $note
-        if $dropped
-        || $shutdown_failed
-        || $rolled_back
-        || $rollback_failed
-        || $wedged
-        || (defined($snapshot) && $rc != 0)
-        || $rc == $PVE::UpdateManager::Runner::TIMEOUT_RC;
-
-    _set_state($target, $state);
-
-    # Through the same closure as every early exit, so the log of a run that
-    # finished is written by the line that writes the log of one that did not.
-    $stop->($rc, $note);
-
-    return ($rc, $note, $facts);
-}
-
 # run_one, and what to do when it does not come back at all.
 #
 # It turns nearly everything into an exit code, but not quite everything: a
@@ -948,7 +337,7 @@ sub _guarded_run_one {
 
     my ($rc, $note, $facts);
     my $survived = eval {
-        ($rc, $note, $facts) = run_one($target, $timeout, $upid, $opts);
+        ($rc, $note, $facts) = PVE::UpdateManager::Target::run_one($target, $timeout, $upid, $opts);
         1;
     };
 
@@ -978,7 +367,7 @@ sub _guarded_run_one {
 sub _record {
     my ($desc, $rc, $note, $finished, $exit, $facts) = @_;
 
-    my $state = !defined($rc) ? 'SKIPPED' : $rc == 0 ? 'OK' : 'FAILED';
+    my $state = _verdict($rc, $facts);
 
     _log("--- $desc: $state ($note)");
 
@@ -1342,10 +731,21 @@ sub run_all {
     # can be powered off in the middle of an update. Nothing is lost by being
     # generous here: the inhibitor is released when the job ends, so the budget
     # only ever matters to a worker that was killed.
+    # A batch with a VM in it is sized by the VM figure, for every target: a VM
+    # boots slower than a container starts and can be rebooted on top, and the
+    # budget only has to be generous, not exact. A batch of containers alone
+    # keeps the container figure - inflating it would hold the node's shutdown
+    # for nothing after a killed worker.
+    my $has_vm = scalar(grep { $_->{type} eq 'qemu' } @$targets);
     my $handling = (
         $opts->{start_stopped}
+            || ($has_vm && $opts->{reboot_vms})
             || ($opts->{snapshot_before} && $opts->{snapshot_shutdown})
-    ) ? $PVE::UpdateManager::Runner::PER_TARGET_GRACE : 0;
+    )
+        ? ($has_vm
+            ? $PVE::UpdateManager::QemuPower::PER_TARGET_GRACE
+            : $PVE::UpdateManager::Runner::PER_TARGET_GRACE)
+        : 0;
 
     my $budget = (($timeout // $PVE::UpdateManager::Runner::DEFAULT_TIMEOUT) + $handling) * $total
         + $PVE::UpdateManager::Runner::OUTER_GRACE;
@@ -1390,14 +790,16 @@ sub run_all {
 
     my $failed = scalar(grep { $_->{state} eq 'FAILED' } @results);
     my $skipped = scalar(grep { $_->{state} eq 'SKIPPED' } @results);
-    my $ok = $total - $failed - $skipped;
+    my $unfixed = scalar(grep { $_->{state} eq 'NOT FIXED' } @results);
+    my $ok = $total - $failed - $skipped - $unfixed;
 
     _log('');
     _log('=== Summary ===');
     for my $r (@results) {
         _log(sprintf('%-8s %s (%s)', $r->{state}, $r->{desc}, $r->{note}));
     }
-    _log("$ok ok, $failed failed, $skipped skipped, $total total");
+    # "not fixed" only when there is one: every other run keeps the line it had.
+    _log("$ok ok, " . ($unfixed ? "$unfixed not fixed, " : '') . "$failed failed, $skipped skipped, $total total");
 
     # Released before the die below, not after: a job that ends red must still
     # give the node back, or a single failed update would keep the machine from
@@ -1430,10 +832,29 @@ sub run_all {
         _log('a notification about the failed targets was handed to Proxmox') if $sent;
     }
 
+    # The security notification about it, at most every cooldown per node (#73)
+    # - also when nothing FAILED, and before the die below for the same reason
+    # as the one above.
+    if ($unfixed && $opts->{security_notify}) {
+        my $sent = eval {
+            require PVE::UpdateManager::SecReact;
+            PVE::UpdateManager::SecReact::notify_unfixed(
+                [grep { $_->{state} eq 'NOT FIXED' } @results], $opts->{security_unfixed_cooldown},
+            );
+        };
+        _log("WARNING: the notification about NOT FIXED targets failed - $@") if $@;
+        _log($sent ? 'a notification about the NOT FIXED targets was handed to Proxmox'
+            : 'no notification about the NOT FIXED targets - the last one is within the cooldown')
+            if !$@;
+    }
+
     # The task must go red when something went wrong, and the message has to say
     # what - a worker that returns quietly after a failed dist-upgrade is worse
-    # than no button at all.
+    # than no button at all. NOT FIXED goes red as well (#73: "the run is OK only when all
+    # security updates are through"), named separately from a failure.
     die "$failed of $total update targets failed\n" if $failed;
+    die "$unfixed of $total update targets are NOT FIXED - security updates pending before the run"
+        . " are still not installed\n" if $unfixed;
 
     return;
 }

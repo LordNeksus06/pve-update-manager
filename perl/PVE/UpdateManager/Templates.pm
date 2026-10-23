@@ -75,7 +75,20 @@ export DEBIAN_FRONTEND=noninteractive
 # Debian only, and it has to be spelled out: nothing inside the container knows
 # which release follows its own. Ubuntu ignores this and asks
 # do-release-upgrade, which does know.
-TARGET_RELEASE=trixie
+#
+# ONE release per run, because that is the only upgrade Debian supports. This
+# used to be a fixed TARGET_RELEASE=trixie, and a bullseye container was
+# rewritten straight to trixie, skipping bookworm (#51). Run the template again
+# for the next step. buster and older are refused: their archive moved to
+# archive.debian.org, and that needs a hand on the sources first.
+next_release() {
+    case "$1" in
+    bullseye) echo bookworm ;;
+    bookworm) echo trixie ;;
+    trixie) echo "" ;;
+    *) return 1 ;;
+    esac
+}
 
 . /etc/os-release
 
@@ -127,9 +140,36 @@ debian)
         echo "no VERSION_CODENAME in /etc/os-release - refusing to guess" >&2
         exit 1
     fi
-    if [ "$VERSION_CODENAME" = "$TARGET_RELEASE" ]; then
-        echo "already on $TARGET_RELEASE - nothing to upgrade to"
+    if ! TARGET_RELEASE=$(next_release "$VERSION_CODENAME"); then
+        echo "Debian $VERSION_CODENAME is not upgraded by this template - only bullseye and bookworm are" >&2
+        exit 1
+    fi
+    if [ -z "$TARGET_RELEASE" ]; then
+        echo "already on $VERSION_CODENAME, the newest release this template knows - nothing to upgrade to"
         exit 0
+    fi
+    echo "upgrading Debian $VERSION_CODENAME to $TARGET_RELEASE"
+
+    # trixie's base-files refuses to unpack on a system whose /bin is still a
+    # directory ("Please install the usrmerge package"). Containers made from
+    # older templates are like that (#51), so before going to trixie the merge
+    # is done on the CURRENT release, before any source is rewritten.
+    # Not before bookworm: there the upgrade merges by itself, and usrmerge
+    # from bullseye pulls perl from bullseye-security, whose packages are gone
+    # from security.debian.org (404, measured 2026-10-22).
+    if [ "$TARGET_RELEASE" = trixie ] && [ ! -L /bin ]; then
+        echo "/bin is not a symlink - merging /usr first (usrmerge)"
+        apt-get -y install usrmerge
+        # usrmerge installs and exits 0 without converting when the system
+        # opted out (debootstrap --no-merged-usr writes the file below) - and
+        # then base-files fails halfway through the upgrade. Stop here instead,
+        # while nothing has been rewritten.
+        if [ ! -L /bin ]; then
+            echo "/usr is still not merged after installing usrmerge - not upgrading to $TARGET_RELEASE" >&2
+            [ -e /etc/unsupported-skip-usrmerge-conversion ] &&
+                echo "/etc/unsupported-skip-usrmerge-conversion exists: this system opted out of the merge" >&2
+            exit 1
+        fi
     fi
 
     for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do

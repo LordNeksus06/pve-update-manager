@@ -14,8 +14,9 @@ normal Proxmox task and records how each target's last run ended.
 
 - **Container tab** — a text box with that container's commands and an *Update*
   button. Nothing is generated or guessed from the distribution.
-- **VM tab** — the same for a Linux VM, run through the QEMU guest agent. See
-  [VMs](#vms) for what a VM needs and what it does not get yet.
+- **VM tab** — the same for a Linux VM, run through the QEMU guest agent, with
+  the same snapshots and the same start-and-stop as a container. See [VMs](#vms)
+  for what a VM needs.
 - **Node tab** — the host and every container on it in one list, with each
   target's last state and a 📄 to its log. Tick some and *Update Selected*, or
   press ▶ / ✎ / 🗑 on a single row.
@@ -25,8 +26,8 @@ normal Proxmox task and records how each target's last run ended.
 - **Templates menu** — cluster-wide starting points to paste in, editable and
   resettable.
 - **Snapshot before an update**, where the storage can take one, with a
-  retention count. On by default, optionally with the container shut down for it,
-  and optionally rolled back to when the update fails.
+  retention count. On by default, optionally with the guest shut down for it,
+  and optionally rolled back to when the update fails. Containers and VMs alike.
 - **Script history** — every save is kept with its time and its author, and can
   be put back from the editor. Retention count, default 3.
 - **Run logs** — every run keeps its own log per target, readable from the
@@ -39,7 +40,8 @@ normal Proxmox task and records how each target's last run ended.
   through Proxmox' own notification system. On by default.
 - **Scheduled runs** — a systemd calendar event per node, serial or parallel.
 - **Datacenter-wide settings** — write one settings page to every node.
-- **Start stopped containers** for their update and stop them again afterwards.
+- **Start stopped guests** for their update and stop them again afterwards.
+- **Reboot VMs when the update requires it**, off by default.
 - **Timeout that kills**, per target, plus an 8 MiB ceiling on what one target
   may write to the task log.
 - **Nothing gets switched off mid-update** — the container carries a `mounted`
@@ -75,12 +77,17 @@ file's contents, so an upgrade invalidates the browser cache by itself.
 for every node at once. Containers have no settings of their own; they follow
 the node they run on.
 
+The window has four tabs: **General** (timeout, start and reboot switches,
+notification, retention, and the parallel pair of manual runs), **Snapshot**,
+**Schedule** and **Security**. The Snapshot tab is shown only on a node where a
+guest can be snapshotted; for all nodes at once it is always shown.
+
 | Setting | Default | What |
 | --- | --- | --- |
-| `snapshot_before` | on | snapshot a container before updating it |
-| `snapshot_keep` | 3 | how many of *our* snapshots to keep per container (1–100) |
-| `snapshot_shutdown` | off | shut a running container down for its snapshot, start it again after |
-| `rollback_on_failure` | off | roll the container back to that snapshot when the update fails |
+| `snapshot_before` | on | snapshot a container or VM before updating it (a VM: disks only) |
+| `snapshot_keep` | 3 | how many of *our* snapshots to keep per guest (1–100) |
+| `snapshot_shutdown` | off | shut a running guest down for its snapshot, start it again after |
+| `rollback_on_failure` | off | roll the guest back to that snapshot when the update fails |
 | `rollback_remove_newer` | on | let that rollback remove snapshots newer than the one it goes back to, when the storage refuses it because of them |
 | `notify_failure` | on | notify when a run had a target fail |
 | `script_versions` | 3 | saved versions of each target's commands to keep (1–50) |
@@ -88,17 +95,35 @@ the node they run on.
 | `parallel_manual` | off | *Update Selected* runs a whole update-order position at once |
 | `parallel_manual_max` | 0 | at most this many targets of a position at once (0–100, 0 = no limit) |
 | `timeout` | 14400 | seconds before a target's update is killed (10–86400) |
-| `start_stopped` | off | start a stopped container for its update, stop it after |
+| `start_stopped` | off | start a stopped container or VM for its update, stop it after |
+| `reboot_vms` | off | reboot a VM whose update left `/var/run/reboot-required` behind, and wait for its agent |
 | `schedule_enabled` | off | run the selected targets on a schedule |
 | `schedule_time` | `03:00` | systemd calendar event |
 | `schedule_parallel` | off | the same for a scheduled run |
 | `schedule_parallel_max` | 0 | the same cap for a scheduled run |
 | `schedule_host` | off | include the node's own script in scheduled runs |
 | `schedule_vmids` | — | which containers the schedule runs |
+| `security_scan` | off | check the targets for pending security updates in the background |
+| `security_interval` | 30 | minutes between two checks (5–10080, in steps of 5) |
+| `security_parallel` | 4 | targets one check reads at the same time (1–64) |
+| `security_targets` | `all` | `all` guests, or only those with an update `script` |
+| `security_source` | `configured` | fetch the security lists from each target's own sources and proxy, or from `debian` directly |
+| `security_exclude` | — | package patterns never counted, e.g. `linux-image-*` |
+| `security_min_severity` | — | react only from `low`, `medium` or `high` up; an unrated fix counts |
+| `security_notify` | on | notify when a check finds pending security updates |
+| `security_notify_once` | on | about each package of a target only once |
+| `security_unfixed_cooldown` | 300 | minutes between two NOT FIXED notifications of a node (0 = every time) |
+| `security_install` | off | update a target as soon as a check finds one |
+| `security_install_mode` | `script` | what that run executes: the target's `script`, or only the affected packages (`security`) |
+| `security_install_vmids` | — | only these guests are updated immediately; empty = every target with pending updates — in mode `script` those with an update script, in mode `security` every guest and the host |
+| `security_install_window` | — | only within this daily window, e.g. `06:00-22:00` |
+| `security_install_gap` | 60 | no immediate update when the scheduled run is due within this many minutes |
+| `security_install_parallel_max` | 1 | immediate updates at the same time (1–64) |
+| `security_reboot` | off | restart a guest that left `/var/run/reboot-required` after such an update |
 
-Datacenter-wide saves write every key except `schedule_vmids` and `last_run`,
-which stay per node. `Sys.Console` is checked on every node before any of them
-is written.
+Datacenter-wide saves write every key except `schedule_vmids`, `security_install_vmids` and `last_run`,
+which stay per node. The permissions (see *Permissions*) are checked on every
+node before any of them is written.
 
 ## Snapshots
 
@@ -113,7 +138,7 @@ is written.
 
 Good to know:
 
-- Capability is asked per container via Proxmox' own `has_feature('snapshot')`
+- Capability is asked per guest via Proxmox' own `has_feature('snapshot')`
   — ZFS, LVM-thin, RBD and btrfs qualify, a directory storage does not.
 - Only names matching `updmgr-<8 digits>-<6 digits>` are ever removed, and age
   comes from Proxmox' `snaptime`, not from the name.
@@ -171,6 +196,54 @@ Good to know:
 - A worker that is killed while the container is down (node reboot, OOM) leaves
   it down. That is the same exposure a `stop`-mode backup has.
 
+## Security check
+
+With `security_scan` on, each node checks its targets for pending security
+updates in the background — every `security_interval` minutes, or at once with
+**Check now** on the node tab. Nothing is installed by the check itself.
+
+How it works, per node:
+
+1. Each guest's apt sources are read (`/etc/apt/sources.list`,
+   `sources.list.d/*.list` and `*.sources`, proxy from `apt.conf`). Every distinct
+   security suite among them is downloaded **once**, by apt itself into a private
+   directory — signature, checksums and proxy as configured in the guest. The
+   node's own apt state is not touched.
+2. Each target's `/var/lib/dpkg/status` is **read**, not executed: through a
+   `chroot` into a running container (so a symlink inside it cannot point the
+   node at its own files), from the root directory of a stopped container where
+   that is a directory (ZFS subvolume, `dir` storage — never mounted), and through
+   the guest agent for a VM.
+3. An installed package older than the version in its security suite is pending.
+
+The result is the **Security** column of the node and datacenter tabs: a count
+and the first package names, or a dash and the reason when a target could not
+be checked (stopped, no guest agent, no apt, no security source, timed out).
+After the lists are fetched, one package file per security source is asked for
+(HEAD, through the guest's apt proxy). When it answers 404 or 410 - the lists
+are still there but the packages moved, as bullseye-security's did to
+archive.debian.org - a target with pending updates from it shows them as
+**packages unavailable** with the address on hover, and the notification says
+so once. The guest's sources are not changed.
+
+| | |
+| --- | --- |
+| a guest that hangs | costs its own time limit; the check moves on, and the web interface never waits for it — the API only reads the stored result |
+| a guest updating right now | is not read in that round |
+| a round still running | the next one is not started on top of it |
+| a notification | one per round and node; with `security_notify_once`, each package once per fixed version |
+| after every run (button, schedule, immediate update) | the security updates the last check found pending are checked again; one still not installed makes the run **NOT FIXED** — red, but no rollback (that stays for a script that exits non-zero), and a security notification at most every `security_unfixed_cooldown` minutes per node. A guest that cannot be read is asked 3 times, 30 s apart. What the run installed leaves the stored check result at once, so the list does not wait for the next check |
+| an immediate update (`security_install`) | a normal run with snapshot and rollback, in its own task; not outside `security_install_window`, not when the scheduled run is due within `security_install_gap` minutes |
+| `security_min_severity` | from the Debian security tracker, downloaded by the node through the proxy the guests' apt uses (each distinct one in turn, direct only if a guest has none); an update Debian has not rated yet counts as reaching any threshold |
+
+Results are kept under `/var/lib/pve-update-manager/security` on each node; a
+small summary per node lives beside the settings in `/etc/pve`, so every node's
+datacenter tab shows every node's numbers.
+
+**Check now** needs `Sys.Console` on the node. Switching the immediate updates
+on needs what a run of each covered guest needs, and `root@pam` when they cover
+every target (an empty guest list), since that includes the host.
+
 ## Script history
 
 Every save that changes something is kept beside the script, named after the
@@ -189,6 +262,7 @@ the box, and Save stores it.
 | how many are kept | `script_versions`, default 3, range 1–50 |
 | the newest entry | the text that is stored now |
 | a save that changes nothing | writes nothing |
+| a text written into the file by hand | kept as a version of its own before a save replaces it — no author, dated by the file |
 | restoring | a normal save, and becomes the newest version itself |
 | removing the commands | keeps the history |
 | `--purge 1`, the destroy tick | deletes it |
@@ -425,9 +499,13 @@ Good to know:
   only passed where apt is 1.9 or newer, which is where the option exists.
 - The **major release upgrade** template handles both distributions: Ubuntu via
   `do-release-upgrade`, Debian by rewriting the codename in `sources.list` and
-  in deb822 `.sources`, then minimal-then-full upgrade. The target release is a
-  variable at the top. It does not reboot. On Ubuntu, *no new release available*
-  is reported as a successful run.
+  in deb822 `.sources`, then minimal-then-full upgrade. Debian moves **one
+  release per run** - bullseye to bookworm, bookworm to trixie - so a bullseye
+  container needs two runs to reach trixie; buster and older are refused. Before
+  going to trixie it merges `/usr` (`usrmerge`) if the container has not, and
+  stops before touching the sources if that did not happen. It does not reboot.
+  On Ubuntu, *no new release available* and on Debian *already on trixie* are
+  reported as a successful run.
 
 ## VMs
 
@@ -474,12 +552,32 @@ How it runs, and why:
   skipped. A worker that is killed mid-update leaves the lock behind;
   `qm unlock <vmid>` clears it.
 
-Not built yet for VMs:
+Snapshots, the rollback and the start-and-stop work as for a container, with the
+same settings - see [Snapshots](#snapshots). What is different for a VM:
 
-- **snapshots** before the update and the rollback: a VM is updated without one,
-  and the log says so;
-- **starting a stopped VM** for its update: a stopped VM is skipped, also with
-  `start_stopped` on, and the row says why;
+- The snapshot holds the **disks only**, never the memory. With the agent
+  running, Proxmox freezes the guest's filesystems around it (`freeze guest
+  filesystem` / `thaw guest filesystem` in the log), so the disks are caught
+  consistent; a database mid-transaction is still caught mid-transaction, which
+  is what `snapshot_shutdown` is for. A CD-ROM - a cloud-init drive included -
+  is not snapshotted and never asked about.
+- A rollback brings the VM back **cold**: Proxmox stops it to roll it back, and
+  one that was running is booted again afterwards.
+- A stopped VM started for its update counts as started once its **guest agent
+  answers**, after at most 600 s. One whose agent does not answer is shut down
+  again and the target **fails**. Measured on a lab VM from `qm start` to the
+  first answer: 54 s, 174 s, and over 300 s after a cold snapshot.
+- `qm start` refuses a VM that carries a lock, and the VM carries the update's
+  `backup` lock by then, so it is started with `--skiplock` - only ever while the
+  lock on it is known to be the update's own.
+- `reboot_vms` reboots a VM after a **successful** update when
+  `/var/run/reboot-required` exists inside it (Debian and Ubuntu write it for a
+  new kernel or libc). The target counts as OK only once the agent answers again;
+  a reboot that does not bring the VM back fails the target, and the row says
+  *exit 0 …, but the reboot it needed FAILED*. Not rebooted: a VM whose update
+  failed, one that was rolled back, and one that was started only for its update
+  - that one is shut down again and boots the new kernel next time. Containers
+  share the node's kernel and are never rebooted.
 
 ## Which shell runs your commands
 
@@ -518,13 +616,19 @@ Good to know:
 | --- | --- |
 | see a container's or VM's tab and script | `VM.Audit` on `/vms/<vmid>` |
 | edit a container's or VM's script | `VM.Config.Options` on `/vms/<vmid>` |
-| run a container's or VM's script | `VM.Console` on `/vms/<vmid>` |
+| run a container's or VM's script | `VM.Console` on `/vms/<vmid>`, plus what the run does with the node's settings: `VM.Snapshot` to snapshot it or remove newer snapshots, `VM.Snapshot` or `VM.Snapshot.Rollback` to roll it back, `VM.PowerMgmt` to start, stop or reboot it |
 | see the node tab | `Sys.Audit` on `/nodes/<node>` |
-| edit the host script | `Sys.Modify` on `/nodes/<node>` |
-| run the host script | `Sys.Console` on `/nodes/<node>` |
+| edit or run the host script | **`root@pam`** — the user itself, not a token; PVE gives a root shell on the node to nobody else |
 | see the datacenter tab | `Sys.Audit` or `VM.Audit` somewhere |
 | edit templates | `Sys.Modify` on `/` |
-| write settings to every node | `Sys.Console` on every node |
+| change a node's settings | `Sys.Console` on `/nodes/<node>`, plus what the node then runs unattended: for every scheduled or immediately updated guest what a run of it needs (above), and `root@pam` when the host is scheduled or immediate updates cover every target |
+| write settings to every node | the same, on every node |
+
+The run rights follow what Proxmox VE asks for the same actions (`VM.Snapshot`,
+`VM.Snapshot.Rollback`, `VM.PowerMgmt`), so an update cannot do to a guest what
+its caller could not do by hand. A settings save that changes nothing is not
+checked; one that changes anything is checked against everything the node
+would then run.
 
 The datacenter list is built from Proxmox' cluster resource index. That index
 filters **guests** by `VM.Audit` and returns every **node** whatever the user
@@ -664,6 +768,14 @@ make deb       # deb-out/pve-update-manager_<version>_all.deb
 The tests need no Proxmox — the Perl modules run against stubs in `tests/stubs`,
 and the hook script runs for real against copies of a real `index.html.tpl`, a
 taint-mode `pvedaemon` and a non-taint `pvesh` in a tmpdir.
+
+The web interface is written as parts under `js/src/NN-name.js` and joined in
+that order into `js/pve-update-manager.js` by `make` — the one file the package
+installs and the browser loads. That file is build output and not tracked: edit
+the parts. A test run started by hand (`node tests/js/…`) reads whatever bundle
+the last `make` left behind.
+
+No file goes over 1000 lines; `make test` refuses one that does (500 is the aim).
 
 ## Licence
 

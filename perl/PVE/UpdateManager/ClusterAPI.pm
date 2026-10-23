@@ -23,7 +23,10 @@ use PVE::JSONSchema qw(get_standard_option);
 use PVE::RESTHandler;
 use PVE::RPCEnvironment;
 
+use PVE::UpdateManager::Authz;
 use PVE::UpdateManager::Config;
+use PVE::UpdateManager::SecSummary;
+use PVE::UpdateManager::Settings;
 use PVE::UpdateManager::Templates;
 
 use base qw(PVE::RESTHandler);
@@ -119,7 +122,7 @@ __PACKAGE__->register_method({
     returns => {
         type => 'object',
         properties => {
-            %{ PVE::UpdateManager::Config::global_settings_schema() },
+            %{ PVE::UpdateManager::Settings::global_settings_schema() },
             nodes => {
                 type => 'integer',
                 description => "How many nodes a save would write to.",
@@ -135,20 +138,20 @@ __PACKAGE__->register_method({
     code => sub {
         my $nodes = $audited_nodes->();
 
-        my $keys = [sort keys %{ PVE::UpdateManager::Config::global_settings_schema() }];
+        my $keys = [sort keys %{ PVE::UpdateManager::Settings::global_settings_schema() }];
 
         # The first node alphabetically, so the same cluster always prefills the
         # same way. Any choice here is arbitrary; a choice that moves around
         # between reloads would be worse than arbitrary.
         my $first = scalar(@$nodes)
-            ? PVE::UpdateManager::Config::load_settings($nodes->[0])
-            : PVE::UpdateManager::Config::default_settings();
+            ? PVE::UpdateManager::Settings::load_settings($nodes->[0])
+            : PVE::UpdateManager::Settings::default_settings();
 
         my $res = { nodes => scalar(@$nodes), uniform => 1 };
         $res->{$_} = $first->{$_} for @$keys;
 
         for my $node (@$nodes) {
-            my $settings = PVE::UpdateManager::Config::load_settings($node);
+            my $settings = PVE::UpdateManager::Settings::load_settings($node);
             next if !scalar(grep { ($settings->{$_} // '') ne ($first->{$_} // '') } @$keys);
             $res->{uniform} = 0;
             last;
@@ -175,8 +178,8 @@ __PACKAGE__->register_method({
     parameters => {
         additionalProperties => 0,
         properties => {
-            (map { $_ => { %{ PVE::UpdateManager::Config::global_settings_schema()->{$_} }, optional => 1 } }
-                keys %{ PVE::UpdateManager::Config::global_settings_schema() }),
+            (map { $_ => { %{ PVE::UpdateManager::Settings::global_settings_schema()->{$_} }, optional => 1 } }
+                keys %{ PVE::UpdateManager::Settings::global_settings_schema() }),
         },
     },
     returns => {
@@ -204,7 +207,13 @@ __PACKAGE__->register_method({
         # this request mean "do not touch it".
         my $settings = { map { $_ => $param->{$_} } grep { defined($param->{$_}) } keys %$param };
 
-        PVE::UpdateManager::Config::save_settings($_, { %$settings }) for @$nodes;
+        # And what each node will then run unattended (#63, #65) - all of them
+        # before any is written, for the reason above.
+        PVE::UpdateManager::Authz::check_settings_save(
+            $rpcenv, $authuser, PVE::UpdateManager::Settings::load_settings($_), $settings,
+        ) for @$nodes;
+
+        PVE::UpdateManager::Settings::save_settings($_, { %$settings }) for @$nodes;
 
         return $nodes;
     },
@@ -419,10 +428,11 @@ __PACKAGE__->register_method({
                 snapshot_shutdown => {
                     type => 'boolean',
                     optional => 1,
-                    description => "Node rows only: whether a container on that node is shut"
+                    description => "Node rows only: whether a container or VM on that node is shut"
                         . " down for its snapshot.",
                 },
                 %{ PVE::UpdateManager::Config::last_run_schema() },
+                %{ PVE::UpdateManager::SecSummary::row_schema() },
             },
         },
     },
@@ -443,6 +453,16 @@ __PACKAGE__->register_method({
         my $nodes = [];
         my $guests = [];
 
+        # The security check's summary (#41) is one file per node in /etc/pve;
+        # each is read once per call, however many guests the node has, and no
+        # guest is touched (#35).
+        my %summary;
+        my $summary_of = sub {
+            my ($n) = @_;
+            return {} if !defined($n);
+            return $summary{$n} //= PVE::UpdateManager::SecSummary::load($n);
+        };
+
         for my $r (@$resources) {
             my $type = $r->{type} // '';
 
@@ -456,7 +476,7 @@ __PACKAGE__->register_method({
                 # asked for Sys.Audit for the very same row.
                 next if !$rpcenv->check($authuser, "/nodes/$node", ['Sys.Audit'], 1);
 
-                my $settings = PVE::UpdateManager::Config::load_settings($node);
+                my $settings = PVE::UpdateManager::Settings::load_settings($node);
                 push @$nodes, {
                     type => 'node',
                     id => $node,
@@ -469,6 +489,7 @@ __PACKAGE__->register_method({
                     snapshot_shutdown =>
                         ($settings->{snapshot_before} && $settings->{snapshot_shutdown}) ? 1 : 0,
                     %{ PVE::UpdateManager::Config::last_run('node', $node) },
+                    %{ PVE::UpdateManager::SecSummary::row_fields($summary_of->($node), 'node', $node) },
                 };
             } elsif ($type eq 'lxc' || $type eq 'qemu') {
                 my $vmid = $r->{vmid};
@@ -483,6 +504,7 @@ __PACKAGE__->register_method({
                     stored => PVE::UpdateManager::Config::has_script($type, $vmid) ? 1 : 0,
                     order => PVE::UpdateManager::Config::load_order($type, $vmid),
                     %{ PVE::UpdateManager::Config::last_run($type, $vmid) },
+                    %{ PVE::UpdateManager::SecSummary::row_fields($summary_of->($r->{node}), $type, $vmid) },
                 };
             }
         }

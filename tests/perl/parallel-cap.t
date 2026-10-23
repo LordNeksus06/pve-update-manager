@@ -23,9 +23,12 @@ use PVE::Tools;
 use PVE::UpdateManager::Config;
 use PVE::UpdateManager::Job;
 use PVE::UpdateManager::Runner;
+use PVE::UpdateManager::Settings;
 
 my $dir = tempdir(CLEANUP => 1);
 $PVE::UpdateManager::Config::BASE_DIR = "$dir/store";
+# The target lock directory is root's below /run (#71); a test user cannot make it.
+$PVE::UpdateManager::Config::LOCK_DIR = "$dir/locks";
 
 # See job.t: the cgroup move is a real busctl call and has no place in a test.
 $PVE::UpdateManager::Runner::CGROUP_FILE = "$dir/no-such-cgroup";
@@ -264,26 +267,26 @@ sub index_of {
 # ── the two settings that feed it ───────────────────────────────────────────
 {
     my $node = 'pve-cap';
-    my $set = PVE::UpdateManager::Config::load_settings($node);
+    my $set = PVE::UpdateManager::Settings::load_settings($node);
     is($set->{parallel_manual_max}, 0, 'a manual parallel run has no cap by default');
     is($set->{schedule_parallel_max}, 0, 'and neither has a scheduled one');
 
-    PVE::UpdateManager::Config::save_settings($node, { parallel_manual_max => 8 });
-    $set = PVE::UpdateManager::Config::load_settings($node);
+    PVE::UpdateManager::Settings::save_settings($node, { parallel_manual_max => 8 });
+    $set = PVE::UpdateManager::Settings::load_settings($node);
     is($set->{parallel_manual_max}, 8, 'the manual cap is stored');
     is($set->{schedule_parallel_max}, 0, 'without touching the scheduled one');
 
     ok(
         !defined(
             eval {
-                PVE::UpdateManager::Config::save_settings($node, { schedule_parallel_max => 101 });
+                PVE::UpdateManager::Settings::save_settings($node, { schedule_parallel_max => 101 });
             }
         ),
         'a cap above the ceiling is refused',
     );
     like($@, qr/schedule_parallel_max/, 'and the refusal names the field');
 
-    my $file = PVE::UpdateManager::Config::settings_file($node);
+    my $file = PVE::UpdateManager::Settings::settings_file($node);
     open(my $in, '<', $file) or die "cannot read $file - $!";
     my $raw = do { local $/ = undef; <$in> };
     close($in);
@@ -292,16 +295,16 @@ sub index_of {
     print $outfh $raw;
     close($outfh);
     is(
-        PVE::UpdateManager::Config::load_settings($node)->{parallel_manual_max},
-        $PVE::UpdateManager::Config::MAX_PARALLEL,
+        PVE::UpdateManager::Settings::load_settings($node)->{parallel_manual_max},
+        $PVE::UpdateManager::Settings::MAX_PARALLEL,
         'a hand-edited cap above the ceiling is clamped, not stored',
     );
 
     # Each switch carries its own number into the run, and no switch carries none.
     is(
-        PVE::UpdateManager::Config::run_opts({}, 1, 9)->{parallel_max},
+        PVE::UpdateManager::Settings::run_opts({}, 1, 9)->{parallel_max},
         9,
         'run_opts hands the run the cap it was given',
     );
-    is(PVE::UpdateManager::Config::run_opts({}, 0, 9)->{parallel_max}, 0, 'a serial run carries no cap');
+    is(PVE::UpdateManager::Settings::run_opts({}, 0, 9)->{parallel_max}, 0, 'a serial run carries no cap');
 }

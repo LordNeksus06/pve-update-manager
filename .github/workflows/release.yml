@@ -65,6 +65,9 @@ jobs:
         for tool in "${!pkg[@]}"; do
           command -v "$tool" >/dev/null 2>&1 || missing+=("${pkg[$tool]}")
         done
+        # PVE has JSON::XS; without it the tests ran only against JSON::PP,
+        # which encodes differently. tests/run-tests.sh adds the JSON::PP run.
+        perl -MJSON::XS -e 1 >/dev/null 2>&1 || missing+=(libjson-xs-perl)
         if [ ${#missing[@]} -eq 0 ]; then
           echo ":: the image already has everything"
           exit 0

@@ -1,0 +1,10 @@
+<html>
+    <body>
+        {{status-text}}
+        {{#each targets}}
+        <h1 style="font-size: 1.2em">{{this.target}}: NOT FIXED</h1>
+        <p>{{this.packages}}</p>
+        {{/each}}
+        <p>The update script of each ended with exit 0, but the security updates the last check had found pending are not all installed afterwards. Nothing was rolled back. The immediate update tries again on the next check; this notification comes again at the earliest after the cooldown set on the node.</p>
+    </body>
+</html>

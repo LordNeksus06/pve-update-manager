@@ -11,7 +11,7 @@ use strict;
 use warnings;
 
 use File::Temp qw(tempdir);
-use Test::More tests => 21;
+use Test::More tests => 23;
 
 use PVE::LXC;
 use PVE::LXC::Config;
@@ -24,6 +24,7 @@ use PVE::UpdateManager::Job;
 use PVE::UpdateManager::LXCAPI;
 use PVE::UpdateManager::QemuAPI;
 use PVE::UpdateManager::Runner;
+use PVE::UpdateManager::Settings;
 
 my $dir = tempdir(CLEANUP => 1);
 $PVE::UpdateManager::Config::BASE_DIR = "$dir/store";
@@ -89,14 +90,18 @@ sub call_run {
 
 {
     PVE::UpdateManager::Config::save_script('qemu', 201, "true\n");
-    PVE::UpdateManager::Config::save_settings('pve', { start_stopped => 1 });
+    PVE::UpdateManager::Settings::save_settings('pve', { start_stopped => 1 });
 
     my $call = call_run(vmid => 201);
-    like($call->{error}, qr/\AVM 201 is not running\n\z/,
-        'a stopped VM is refused even with "start stopped" on, and without advice to turn it on');
-    is(scalar(@{ $call->{forked} }), 0, 'and nothing is started');
+    is($call->{error}, '', 'with "start stopped" on, a stopped VM starts a run - one switch for both kinds');
+    is(scalar(@{ $call->{forked} }), 1, 'and a task is forked for it');
 
-    PVE::UpdateManager::Config::save_settings('pve', { start_stopped => 0 });
+    PVE::UpdateManager::Settings::save_settings('pve', { start_stopped => 0 });
+
+    $call = call_run(vmid => 201);
+    like($call->{error}, qr/\AVM 201 is not running \(enable 'start stopped guests' in the node's/,
+        'with it off the VM is refused, with the same advice a container gets');
+    is(scalar(@{ $call->{forked} }), 0, 'and nothing is started');
 }
 
 {

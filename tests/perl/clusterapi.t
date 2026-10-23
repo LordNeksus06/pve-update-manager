@@ -18,6 +18,7 @@ use PVE::RESTHandler;
 use PVE::RPCEnvironment;
 use PVE::UpdateManager::ClusterAPI;
 use PVE::UpdateManager::Config;
+use PVE::UpdateManager::Settings;
 use PVE::UpdateManager::Templates;
 
 my $dir = tempdir(CLEANUP => 1);
@@ -43,16 +44,16 @@ my $targets = PVE::RESTHandler::registered('PVE::UpdateManager::ClusterAPI', 'ta
 # would point every other node at containers it does not have - and un-tick the
 # ones it does.
 {
-    PVE::UpdateManager::Config::save_settings('pve-a', { schedule_vmids => '101,102', timeout => 600 });
-    PVE::UpdateManager::Config::save_settings('pve-b', { schedule_vmids => '201', timeout => 900 });
-    PVE::UpdateManager::Config::mark_schedule_run('pve-b', 12345);
+    PVE::UpdateManager::Settings::save_settings('pve-a', { schedule_vmids => '101,102', timeout => 600 });
+    PVE::UpdateManager::Settings::save_settings('pve-b', { schedule_vmids => '201', timeout => 900 });
+    PVE::UpdateManager::Settings::mark_schedule_run('pve-b', 12345);
 
     my $written = $set_settings->({ timeout => 7200, parallel_manual => 1 });
 
     is_deeply($written, ['pve-a', 'pve-b'], 'both nodes were written, and it says which');
 
-    my $a = PVE::UpdateManager::Config::load_settings('pve-a');
-    my $b = PVE::UpdateManager::Config::load_settings('pve-b');
+    my $a = PVE::UpdateManager::Settings::load_settings('pve-a');
+    my $b = PVE::UpdateManager::Settings::load_settings('pve-b');
 
     is($a->{timeout}, 7200, 'the first node took the new timeout');
     is($b->{timeout}, 7200, 'and so did the second, overwriting what it had');
@@ -66,11 +67,11 @@ my $targets = PVE::RESTHandler::registered('PVE::UpdateManager::ClusterAPI', 'ta
 # Sending one key must not reset the others to their defaults - that is the
 # difference between "apply these" and "reset everything and apply these".
 {
-    PVE::UpdateManager::Config::save_settings('pve-a', { start_stopped => 1, snapshot_keep => 7 });
+    PVE::UpdateManager::Settings::save_settings('pve-a', { start_stopped => 1, snapshot_keep => 7 });
 
     $set_settings->({ timeout => 3600 });
 
-    my $a = PVE::UpdateManager::Config::load_settings('pve-a');
+    my $a = PVE::UpdateManager::Settings::load_settings('pve-a');
     is($a->{timeout}, 3600, 'the sent key is written');
     is($a->{start_stopped}, 1, 'an unsent key keeps the value that node had');
     is($a->{snapshot_keep}, 7, 'including the ones this dialog does not show');
@@ -81,8 +82,8 @@ my $targets = PVE::RESTHandler::registered('PVE::UpdateManager::ClusterAPI', 'ta
 # Applying to half a cluster is worse than refusing: nothing on screen would say
 # which half, and the operator would have to open every node to find out.
 {
-    PVE::UpdateManager::Config::save_settings('pve-a', { timeout => 1111 });
-    PVE::UpdateManager::Config::save_settings('pve-b', { timeout => 1111 });
+    PVE::UpdateManager::Settings::save_settings('pve-a', { timeout => 1111 });
+    PVE::UpdateManager::Settings::save_settings('pve-b', { timeout => 1111 });
 
     local $PVE::RPCEnvironment::CHECK = sub {
         my ($path) = @_;
@@ -95,7 +96,7 @@ my $targets = PVE::RESTHandler::registered('PVE::UpdateManager::ClusterAPI', 'ta
     );
 
     is(
-        PVE::UpdateManager::Config::load_settings('pve-a')->{timeout},
+        PVE::UpdateManager::Settings::load_settings('pve-a')->{timeout},
         1111,
         'and the node that WOULD have been allowed was not written either',
     );
@@ -105,9 +106,9 @@ my $targets = PVE::RESTHandler::registered('PVE::UpdateManager::ClusterAPI', 'ta
 {
     # From the same starting point on both nodes: the blocks above left them
     # differing in keys this one is not about, and "uniform" means all of them.
-    my $same = { %{ PVE::UpdateManager::Config::default_settings() }, timeout => 4444 };
-    PVE::UpdateManager::Config::save_settings('pve-a', { %$same });
-    PVE::UpdateManager::Config::save_settings('pve-b', { %$same });
+    my $same = { %{ PVE::UpdateManager::Settings::default_settings() }, timeout => 4444 };
+    PVE::UpdateManager::Settings::save_settings('pve-a', { %$same });
+    PVE::UpdateManager::Settings::save_settings('pve-b', { %$same });
 
     my $res = $get_settings->({});
 
@@ -117,7 +118,7 @@ my $targets = PVE::RESTHandler::registered('PVE::UpdateManager::ClusterAPI', 'ta
     ok(!exists($res->{schedule_vmids}), 'and it does not offer the per-node key at all');
     ok(!exists($res->{last_run}), 'nor the schedule clock');
 
-    PVE::UpdateManager::Config::save_settings('pve-b', { timeout => 5555 });
+    PVE::UpdateManager::Settings::save_settings('pve-b', { timeout => 5555 });
 
     $res = $get_settings->({});
     is($res->{uniform}, 0, 'a node that differs is reported, which is what the warning is for');
@@ -165,8 +166,8 @@ my $targets = PVE::RESTHandler::registered('PVE::UpdateManager::ClusterAPI', 'ta
         { type => 'node', node => 'pve-a' },
         { type => 'node', node => 'pve-b' },
     );
-    PVE::UpdateManager::Config::save_settings('pve-a', { timeout => 7777 });
-    PVE::UpdateManager::Config::save_settings('pve-b', { timeout => 8888 });
+    PVE::UpdateManager::Settings::save_settings('pve-a', { timeout => 7777 });
+    PVE::UpdateManager::Settings::save_settings('pve-b', { timeout => 8888 });
 
     local $PVE::RPCEnvironment::CHECK = sub {
         my ($path) = @_;

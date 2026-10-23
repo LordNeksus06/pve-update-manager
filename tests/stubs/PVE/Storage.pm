@@ -17,6 +17,19 @@ our $CONFIG = { ids => {} };
 
 sub config { return $CONFIG; }
 
+# What a volume id resolves to on the node: a directory for a ZFS subvolume or a
+# dir storage, a block device for LVM. volid => path; the real one dies for a
+# storage it does not know.
+our %PATH;
+
+sub path {
+    my ($cfg, $volid) = @_;
+
+    die "storage for '$volid' does not exist\n" if !exists($PATH{$volid});
+
+    return $PATH{$volid};
+}
+
 # Snapshots that exist on the storage and NOT in the container's config, keyed
 # by volume id: { 'teststore:subvol-101-disk-0' => [ { name => ..., snaptime => ... } ] }.
 #
@@ -37,10 +50,13 @@ our %DELETE_DIE;
 sub _snapshot_list {
     my ($volid) = @_;
 
-    my ($vmid) = $volid =~ m/subvol-(\d+)-disk/;
+    # subvol-N is a container's volume, vm-N a VM's - see the two config stubs.
+    my ($kind, $vmid) = $volid =~ m/(subvol|vm)-(\d+)-disk/;
     return [] if !defined($vmid);
 
-    my $snapshots = $PVE::LXC::Config::CONFIGS{$vmid}->{snapshots} // {};
+    my $snapshots = (
+        $kind eq 'vm' ? $PVE::QemuConfig::CONFIGS{$vmid} : $PVE::LXC::Config::CONFIGS{$vmid}
+    )->{snapshots} // {};
 
     my @all = map { { name => $_, snaptime => $snapshots->{$_}->{snaptime} // 0 } }
         keys %$snapshots;

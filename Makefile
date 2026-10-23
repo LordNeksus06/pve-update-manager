@@ -36,9 +36,25 @@ PERL_SCRIPTS := tools/pve-update-manager-schedule
 # with a message about the wrong file.
 JS_TESTS := $(wildcard tests/js/*.js)
 
+# The web interface is written as parts under js/src and shipped as ONE file:
+# the browser loads a single <script> tag, which the hook script inserts and
+# version-stamps by the file's contents, so nothing about loading it changed
+# when the 3684-line file was split (#21). The parts are joined in the order of
+# their number prefix - NN-name.js - and the result is build output, not tracked:
+# a tracked copy beside its parts is a second version of every line to drift.
+JS_PARTS := $(sort $(wildcard js/src/*.js))
+JS_BUNDLE := js/pve-update-manager.js
+
 .PHONY: all check test install deb clean version
 
 all: check
+
+# Through a temporary file, so an interrupted build never leaves a half-written
+# bundle that the tests would then load.
+$(JS_BUNDLE): $(JS_PARTS)
+	@test -n "$(JS_PARTS)" || { echo "no parts under js/src" >&2; exit 1; }
+	cat $(JS_PARTS) > $@.tmp
+	mv $@.tmp $@
 
 version:
 	@bash version.sh
@@ -49,7 +65,7 @@ version:
 # Proxmox: `perl -c` runs BEGIN/use but not the module body, so a stub package
 # per PVE module is enough to catch a syntax error or a missing import - and it
 # means the check runs in CI, where no Proxmox exists.
-check:
+check: $(JS_BUNDLE)
 	@echo ":: shellcheck"
 	@shellcheck $(SHELL_SCRIPTS)
 	@echo ":: perl -c (against tests/stubs)"
@@ -57,7 +73,7 @@ check:
 		perl -I tests/stubs -I perl -c "$$m" || exit 1; \
 	done
 	@echo ":: javascript syntax"
-	@for j in js/pve-update-manager.js $(JS_TESTS); do \
+	@for j in $(JS_BUNDLE) $(JS_PARTS) $(JS_TESTS); do \
 		node --check "$$j" || exit 1; \
 	done
 	@echo ":: OK"
@@ -66,11 +82,11 @@ test: check
 	@bash tests/run-tests.sh
 
 # ── Install ─────────────────────────────────────────────────────────────────
-install:
+install: $(JS_BUNDLE)
 	install -d $(PERLDIR)
 	install -m 0644 $(PERL_MODULES) $(PERLDIR)
 	install -d $(JSDIR)
-	install -m 0644 js/pve-update-manager.js $(JSDIR)
+	install -m 0644 $(JS_BUNDLE) $(JSDIR)
 	install -d $(TPLDIR)
 	install -m 0644 $(NOTIFY_TEMPLATES) $(TPLDIR)
 	install -d $(SBINDIR)
@@ -88,3 +104,4 @@ deb:
 
 clean:
 	rm -rf deb-out
+	rm -f $(JS_BUNDLE) $(JS_BUNDLE).tmp

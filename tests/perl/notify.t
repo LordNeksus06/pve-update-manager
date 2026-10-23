@@ -13,7 +13,7 @@
 use strict;
 use warnings;
 
-use Test::More tests => 69;
+use Test::More tests => 70;
 
 use PVE::Notify;
 use PVE::UpdateManager::Notify;
@@ -307,4 +307,23 @@ is(
     ok(!$@, 'a notification that cannot be sent does not die');
     ok(!defined($sent), 'and says so rather than claiming it went out');
     like($warned, qr/no notification config/, 'the reason is in the log, not swallowed');
+}
+
+# A VM failed only by the reboot its update asked for: the script exited 0, so
+# without its own line the block would carry exit 0 under FAILED and no reason.
+{
+    my $report = PVE::UpdateManager::Notify::failure_report(
+        [
+            {
+                desc => 'VM 200 (web-vm)', state => 'FAILED',
+                note => 'exit 0 after 80s, but the reboot it needed FAILED',
+                exit => -1, finished => 1787249277,
+                facts => { exit => 0, elapsed => 80, reboot_failed => 1 },
+            },
+        ],
+        'UPID:pve-test:1:2:3:',
+    );
+
+    like($report->{'failed-targets'}->[0]->{also}, qr/the reboot the update needed FAILED/,
+        'a failed reboot is named in the notification');
 }

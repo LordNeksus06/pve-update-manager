@@ -74,6 +74,11 @@ function load(answer, options) {
                 };
             },
             getStore: function () {},
+            // The settings window caps its height against this in
+            // initComponent; a laptop-sized answer.
+            Element: {
+                getViewportHeight: () => 900,
+            },
             Msg: {
                 alert: function (title, msg) {
                     alerts.push({ title: title, msg: msg });

@@ -1,0 +1,16 @@
+<html>
+    <body>
+        {{status-text}}
+        {{#each targets}}
+        <h1 style="font-size: 1.2em">{{this.target}}: {{this.count}} pending</h1>
+        {{#if this.warning}}<p><b>{{this.warning}}</b></p>{{/if}}
+        <table>
+            <tr><th align="left">Package</th><th align="left">Installed</th><th align="left">Fixed in</th><th align="left">Severity</th></tr>
+            {{#each this.packages}}
+            <tr><td>{{this.name}}</td><td>{{this.installed}}</td><td>{{this.fixed}}</td><td>{{this.urgency}}</td></tr>
+            {{/each}}
+        </table>
+        {{/each}}
+        <p>Found by the background security check of the Update Manager. Nothing has been installed by the check itself.</p>
+    </body>
+</html>

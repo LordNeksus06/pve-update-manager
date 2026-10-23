@@ -88,6 +88,20 @@ claim('a failed row with no exit code says so, rather than saying "undefined"', 
     assert.ok(updmgr.renderLastRun({ last_state: 'failed', last_exit: 100 }).includes('exit 100'));
 });
 
+claim('a NOT FIXED row is red, says NOT FIXED, and names the packages on hover (#73)', () => {
+    const { updmgr } = load(() => ({}));
+
+    const cell = updmgr.renderLastRun({
+        last_state: 'not_fixed', last_exit: 0, last_finished: 1,
+        last_note: 'exit 0 after 9s, NOT FIXED: openssl 3.5.1-1, expected >= 3.5.1-1+deb13u1 <b>',
+    });
+    assert.ok(cell.includes('NOT FIXED'), cell);
+    assert.ok(cell.includes('critical'), 'red: ' + cell);
+    assert.ok(!cell.includes('failed'), 'not called a failure - no rollback happened for it: ' + cell);
+    assert.ok(cell.includes('data-qtip=') && cell.includes('openssl'), 'the packages on hover: ' + cell);
+    assert.ok(!cell.includes('<b>'), 'escaped: ' + cell);
+});
+
 claim('what the server put in a row is escaped before it becomes a cell', () => {
     const { updmgr } = load(() => ({}));
 
@@ -198,6 +212,20 @@ claim('and says nothing about downtime where the node does not do that', () => {
     me.runSelected.call(me);
 
     assert.ok(!alerts[0].msg.includes('shut down for their snapshot'));
+});
+
+claim('a VM is counted with the containers - it is shut down for its snapshot too', () => {
+    const rows = JSON.parse(JSON.stringify(ROWS));
+    rows.push({ type: 'qemu', id: '200', vmid: 200, name: 'vm', stored: true, order: 0 });
+
+    const { me, alerts } = gridFor(() => null, { rows: rows, selected: ['101', '200'] });
+
+    me.runSelected.call(me);
+
+    assert.ok(
+        alerts[0].msg.includes('2 of them are shut down for their snapshot'),
+        `the VM is in the count: ${alerts[0].msg}`,
+    );
 });
 
 claim('the host row is not counted as a container that gets shut down', () => {

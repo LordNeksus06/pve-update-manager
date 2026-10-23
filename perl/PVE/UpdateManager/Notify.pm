@@ -119,6 +119,11 @@ sub _target_block {
             $facts->{dropped}, ($facts->{dropped} == 1 ? '' : 's'))
         if ($facts->{dropped} // 0) > 0;
     push @also, 'the container could NOT be stopped again' if $facts->{shutdown_failed};
+    # A VM whose script exited 0 and that is failed only because the reboot it
+    # needed did not bring it back: without this line the block would show exit 0
+    # under a FAILED heading and nothing that says why.
+    push @also, 'the reboot the update needed FAILED - the VM may be down'
+        if $facts->{reboot_failed};
     push @also,
         sprintf('%d snapshot%s could NOT be removed',
             $facts->{stuck}, ($facts->{stuck} == 1 ? '' : 's'))

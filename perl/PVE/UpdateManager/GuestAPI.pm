@@ -17,10 +17,14 @@ use PVE::Exception qw(raise_param_exc);
 use PVE::JSONSchema qw(get_standard_option);
 use PVE::RPCEnvironment;
 
+use PVE::UpdateManager::Authz;
 use PVE::UpdateManager::Config;
 use PVE::UpdateManager::Guest;
 use PVE::UpdateManager::Job;
+use PVE::UpdateManager::Logs;
 use PVE::UpdateManager::Runner;
+use PVE::UpdateManager::Settings;
+use PVE::UpdateManager::Versions;
 
 sub register_methods {
     my ($pkg, $type) = @_;
@@ -200,7 +204,7 @@ sub register_methods {
         code => sub {
             my ($param) = @_;
 
-            return PVE::UpdateManager::Config::list_versions($type, $param->{vmid});
+            return PVE::UpdateManager::Versions::list_versions($type, $param->{vmid});
         },
     });
 
@@ -243,7 +247,7 @@ sub register_methods {
             my ($param) = @_;
 
             my $script =
-                PVE::UpdateManager::Config::load_version($type, $param->{vmid}, $param->{version});
+                PVE::UpdateManager::Versions::load_version($type, $param->{vmid}, $param->{version});
 
             raise_param_exc({ version => "no such version" }) if !defined($script);
 
@@ -333,12 +337,12 @@ sub register_methods {
             # is going - keeping either would hand it to whatever gets that vmid next.
             if ($param->{purge}) {
                 PVE::UpdateManager::Config::delete_state($type, $vmid);
-                PVE::UpdateManager::Config::delete_versions($type, $vmid);
+                PVE::UpdateManager::Versions::delete_versions($type, $vmid);
                 PVE::UpdateManager::Config::delete_order($type, $vmid);
                 # The kept run logs too, and for the same reason: a log of what CT
                 # 101 did last week, handed to whatever is created as 101 next, is
                 # somebody else's history in somebody else's editor.
-                PVE::UpdateManager::Config::delete_logs($type, $vmid);
+                PVE::UpdateManager::Logs::delete_logs($type, $vmid);
             }
 
             return undef;
@@ -384,7 +388,7 @@ sub register_methods {
                     state => {
                         type => 'string',
                         optional => 1,
-                        enum => ['ok', 'failed', 'skipped'],
+                        enum => ['ok', 'not_fixed', 'failed', 'skipped'],
                         description => "How that run ended, read from the log's own header."
                             . " Absent for a log that has none - one a killed worker left half"
                             . " written.",
@@ -408,7 +412,7 @@ sub register_methods {
         code => sub {
             my ($param) = @_;
 
-            return PVE::UpdateManager::Config::list_logs($type, $param->{vmid});
+            return PVE::UpdateManager::Logs::list_logs($type, $param->{vmid});
         },
     });
 
@@ -446,7 +450,7 @@ sub register_methods {
         code => sub {
             my ($param) = @_;
 
-            my $text = PVE::UpdateManager::Config::load_log($type, $param->{vmid}, $param->{log});
+            my $text = PVE::UpdateManager::Logs::load_log($type, $param->{vmid}, $param->{log});
 
             raise_param_exc({ log => "no such run log" }) if !defined($text);
 
@@ -464,8 +468,10 @@ sub register_methods {
             . " or an empty string when the guest has no script stored - that is recorded as a"
             . " skipped run on the guest itself and starts no task.",
         permissions => {
-            description => "Running arbitrary commands as root inside a guest is what console"
-                . " access already allows, so VM.Console is what this needs.",
+            description => "VM.Console - running commands as root inside a guest is what console"
+                . " access already allows - and what the run does besides with the node's"
+                . " settings: VM.Snapshot to snapshot, VM.Snapshot or VM.Snapshot.Rollback to roll"
+                . " back, VM.PowerMgmt to start, stop or reboot it, as PVE asks for those (#64).",
             check => ['perm', '/vms/{vmid}', ['VM.Console']],
         },
         parameters => {
@@ -504,11 +510,12 @@ sub register_methods {
             my $vmid = $param->{vmid};
             # A guest has no settings of its own - it inherits those of the node
             # it runs on, which is where the Settings dialog lives.
-            my $settings = PVE::UpdateManager::Config::load_settings($param->{node});
+            my $settings = PVE::UpdateManager::Settings::load_settings($param->{node});
             my $timeout = $param->{timeout} // $settings->{timeout};
             # No parallel flag: this endpoint runs exactly one guest, and one
             # target is one wave whichever way the node's switch is set.
-            my $opts = PVE::UpdateManager::Config::run_opts($settings);
+            my $opts = PVE::UpdateManager::Settings::run_opts($settings);
+            PVE::UpdateManager::Authz::check_guest_run($rpcenv, $authuser, "/vms/$vmid", $settings);
 
             if (defined(my $script = $param->{script})) {
                 # Running is VM.Console; STORING is VM.Config.Options, here as
@@ -544,7 +551,7 @@ sub register_methods {
             die "$label $vmid is not a $noun on node $param->{node}\n" if !$conf;
 
             # And a template is not one either. Without this the answer below is
-            # "not running - enable 'start stopped containers' to update it anyway",
+            # "not running - enable 'start stopped guests' to update it anyway",
             # which is advice that cannot work: PVE refuses to start a template and
             # refuses to snapshot one.
             die "$label $vmid is a template - there is nothing to update\n"
@@ -569,14 +576,11 @@ sub register_methods {
 
             # Checked here rather than in the worker: the caller gets a plain error
             # response instead of a task that has to be opened to find out why it
-            # did nothing. Unless the node is set to start stopped containers, in
-            # which case being stopped is exactly what the run is meant to handle.
-            #
-            # A VM is not started for its update yet, whatever the setting says, so
-            # it gets no advice to turn the setting on.
+            # did nothing. Unless the node is set to start stopped guests, in which
+            # case being stopped is exactly what the run is meant to handle - for a
+            # VM as for a container, one switch for both.
             if (!PVE::UpdateManager::Guest::is_running($type, $vmid)) {
-                die "$label $vmid is not running\n" if $type eq 'qemu';
-                die "$label $vmid is not running (enable 'start stopped containers' in the node's"
+                die "$label $vmid is not running (enable 'start stopped guests' in the node's"
                     . " Update Manager settings to update it anyway)\n"
                     if !$opts->{start_stopped};
             }

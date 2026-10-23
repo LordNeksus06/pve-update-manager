@@ -21,7 +21,7 @@ use warnings;
 use B ();
 use File::Temp qw(tempdir);
 use MIME::Base64 qw(encode_base64 decode_base64);
-use Test::More tests => 60;
+use Test::More tests => 66;
 
 use PVE::QemuServer::Monitor;
 use PVE::UpdateManager::QemuRunner;
@@ -86,7 +86,7 @@ sub fake_agent {
             if (($args{path} // '') eq '/bin/rm') {
                 return { pid => 4243 };
             }
-            ($log, $rcf) = @{ $args{arg} }[3, 5];
+            ($log, $rcf) = @{ $args{arg} }[4, 6];
             $files{$log} = '' if !$o{no_log};
             $pid_known = 1;
             return { pid => 4242 };
@@ -195,17 +195,23 @@ sub is_string { return (B::svref_2object(\$_[0])->FLAGS & B::SVf_POK()) ? 1 : 0;
     ok($exec, 'the script was started with /bin/sh');
     my @arg = @{ $exec->{args}->{arg} };
     is($arg[1], $PVE::UpdateManager::QemuRunner::VM_OUTER, 'running the outer part');
-    is($arg[4], $PVE::UpdateManager::QemuRunner::VM_INNER, 'which is handed the inner part as an argument');
+    is($arg[5], $PVE::UpdateManager::QemuRunner::VM_INNER, 'which is handed the inner part as an argument');
 
+    # #72: a private directory under a random name, not two files in /var/tmp
+    # under a name built from vmid, time and pid that any VM user could guess.
     my ($open) = calls_of($calls, 'guest-file-open');
-    is($open->{args}->{path}, $arg[3], 'the file that is read is the one the outer part writes');
-    like($arg[3], qr{\A/var/tmp/pve-update-manager-200-\d+-\d+\.log\z}, 'in /var/tmp, named after the VM');
-    (my $rcf = $arg[3]) =~ s/\.log\z/.rc/;
-    is($arg[5], $rcf, 'and the exit code goes beside it');
+    like($arg[3], qr{\A/var/tmp/pve-update-manager-200-[0-9a-f]{32}\z},
+        'the run gets a directory in /var/tmp, named after the VM and 128 random bits');
+    is($arg[4], "$arg[3]/run.log", 'the log is inside it');
+    is($open->{args}->{path}, $arg[4], 'and is the file that is read');
+    is($arg[6], "$arg[3]/run.rc", 'the exit code is inside it too');
+
+    my (undef, undef, $calls2) = run(chunks => ["x\n"]);
+    isnt(main_exec($calls2)->{args}->{arg}->[3], $arg[3], 'a second run gets another name');
 
     my @rm = grep { ($_->{args}->{path} // '') eq '/bin/rm' } calls_of($calls, 'guest-exec');
-    is(scalar(@rm), 1, 'both are removed inside the VM afterwards');
-    is_deeply($rm[0]->{args}->{arg}, ['-f', '--', $arg[3], $rcf], 'those two files, and nothing else');
+    is(scalar(@rm), 1, 'the directory is removed inside the VM afterwards');
+    is_deeply($rm[0]->{args}->{arg}, ['-rf', '--', $arg[3]], 'that directory, and nothing else');
     is(scalar(calls_of($calls, 'guest-file-close')), 1, 'the log handle is given back');
     ok(
         (grep { $_->{args}->{pid} == 4243 } calls_of($calls, 'guest-exec-status')),
@@ -217,7 +223,8 @@ sub is_string { return (B::svref_2object(\$_[0])->FLAGS & B::SVf_POK()) ? 1 : 0;
 {
     my ($rc, $log) = run(chunks => ["x\n"], rm_exit => 1);
     is($rc, 0, "a failed removal does not change the run's verdict");
-    like($log->[-1], qr{WARNING: could not remove /var/tmp/pve-update-manager-200-\S+\.log and }, 'but it is said');
+    like($log->[-1], qr{WARNING: could not remove /var/tmp/pve-update-manager-200-[0-9a-f]{32} inside VM 200},
+        'but it is said');
 }
 
 # ── the JSON types the agent insists on ─────────────────────────────────────
@@ -242,7 +249,7 @@ sub is_string { return (B::svref_2object(\$_[0])->FLAGS & B::SVf_POK()) ? 1 : 0;
     my @wide = grep { m/[^\x00-\x7f]/ } @{ main_exec($calls)->{args}->{arg} };
     is(scalar(@wide), 0, 'a script with an umlaut and an emoji sends ASCII only');
     is(
-        decode_base64(main_exec($calls)->{args}->{arg}->[8]),
+        decode_base64(main_exec($calls)->{args}->{arg}->[9]),
         PVE::UpdateManager::Runner::to_bytes($script),
         'because it travels as base64 of its UTF-8 bytes',
     );
@@ -431,9 +438,21 @@ sub inner {
     local $ENV{PATH} = "$dir/bin:$ENV{PATH}";
     my $rc = system(
         '/bin/sh', '-c', $PVE::UpdateManager::QemuRunner::VM_OUTER, 'pve-update-manager',
-        "$dir/outer.log", $PVE::UpdateManager::QemuRunner::VM_INNER,
-        "$dir/outer.rc", 30, 1, encode_base64("echo scoped\nexit 3\n", ''), '/bin/sh',
+        "$dir/outer", "$dir/outer/run.log", $PVE::UpdateManager::QemuRunner::VM_INNER,
+        "$dir/outer/run.rc", 30, 1, encode_base64("echo scoped\nexit 3\n", ''), '/bin/sh',
     );
+    is((stat("$dir/outer"))[2] & 07777, 0700, 'the outer part makes the run directory for root alone (#72)');
+    is((stat("$dir/outer/run.rc"))[2] & 07777, 0600, 'and the exit code in it is readable by root only');
+
+    # A name that is taken - planted, or a symlink - is not used: nothing runs.
+    mkdir("$dir/taken") or die;
+    my $rc2 = system(
+        '/bin/sh', '-c', $PVE::UpdateManager::QemuRunner::VM_OUTER, 'pve-update-manager',
+        "$dir/taken", "$dir/taken/run.log", $PVE::UpdateManager::QemuRunner::VM_INNER,
+        "$dir/taken/run.rc", 30, 1, encode_base64("touch '$dir/ran'\n", ''), '/bin/sh',
+    );
+    is($rc2 >> 8, 125, 'a run directory that already exists stops the run with 125');
+    ok(!-e "$dir/ran" && !-e "$dir/taken/run.rc", 'before the script ran and before an exit code was written');
 
     SKIP: {
         skip('no /run/systemd/system on this machine, so the outer part takes its fallback', 3)
@@ -448,7 +467,7 @@ sub inner {
         is_deeply([@args[0 .. 3]], ['--scope', '--quiet', '--collect', '--'],
             'the outer part hands over through systemd-run --scope');
         is($rc >> 8, 3, "and the run still ends with the script's code");
-        is((stat("$dir/outer.log"))[2] & 07777, 0600, 'the log it opened is readable by root only');
+        is((stat("$dir/outer/run.log"))[2] & 07777, 0600, 'the log it opened is readable by root only');
     }
 }
 

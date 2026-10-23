@@ -19,6 +19,7 @@ use PVE::RPCEnvironment;
 use PVE::UpdateManager::Config;
 use PVE::UpdateManager::Runner;
 use PVE::UpdateManager::Job;
+use PVE::UpdateManager::Target;
 use PVE::UpdateManager::LXCAPI;
 
 my $dir = tempdir(CLEANUP => 1);
@@ -89,7 +90,7 @@ sub state_of {
 {
     $PVE::LXC::RUNNING{202} = 4711;
 
-    PVE::UpdateManager::Job::run_one({ type => 'lxc', id => 202 }, 60, undef, {});
+    PVE::UpdateManager::Target::run_one({ type => 'lxc', id => 202 }, 60, undef, {});
 
     is(
         state_of(202)->{note},

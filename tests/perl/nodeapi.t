@@ -16,7 +16,7 @@ use strict;
 use warnings;
 
 use File::Temp qw(tempdir);
-use Test::More tests => 43;
+use Test::More tests => 45;
 
 use PVE::LXC;
 use PVE::LXC::Config;
@@ -29,6 +29,7 @@ use PVE::Storage;
 use PVE::Tools;
 use PVE::UpdateManager::Config;
 use PVE::UpdateManager::NodeAPI;
+use PVE::UpdateManager::Settings;
 
 my $dir = tempdir(CLEANUP => 1);
 $PVE::UpdateManager::Config::BASE_DIR = "$dir/store";
@@ -95,7 +96,7 @@ sub ids_of {
 # ── what the new columns carry ──────────────────────────────────────────────
 {
     PVE::UpdateManager::Config::save_order('lxc', 101, 4);
-    PVE::UpdateManager::Config::save_settings(
+    PVE::UpdateManager::Settings::save_settings(
         'pve-test', { snapshot_before => 1, snapshot_shutdown => 1, parallel_manual => 1 },
     );
 
@@ -113,11 +114,11 @@ sub ids_of {
 
     # It is a node setting about SNAPSHOTS: with snapshots off there is no
     # downtime to warn about, and the dialog must not promise any.
-    PVE::UpdateManager::Config::save_settings('pve-test', { snapshot_before => 0 });
+    PVE::UpdateManager::Settings::save_settings('pve-test', { snapshot_before => 0 });
     ($host) = grep { $_->{type} eq 'node' } @{ $targets->({ node => 'pve-test' }) };
     is($host->{snapshot_shutdown}, 0, 'with snapshots off, nothing is shut down for one');
 
-    PVE::UpdateManager::Config::save_settings('pve-test', { snapshot_before => 1 });
+    PVE::UpdateManager::Settings::save_settings('pve-test', { snapshot_before => 1 });
     PVE::UpdateManager::Config::save_order('lxc', 101, 0);
 }
 
@@ -145,15 +146,14 @@ sub call_run {
 }
 
 {
-    # Sys.Console, not Sys.Audit: this runs stored commands as root on the node.
-    local $PVE::RPCEnvironment::CHECK = sub {
-        my ($path, $privs) = @_;
-        return !($path eq '/nodes/pve-test' && grep { $_ eq 'Sys.Console' } @$privs);
-    };
+    # root@pam, not a privilege: this runs stored commands as root on the node,
+    # and PVE gives a root shell to root@pam alone (#63). Every privilege granted.
+    local $PVE::RPCEnvironment::CHECK = undef;
+    local $PVE::RPCEnvironment::USER = 'admin@pve';
 
     my $call = call_run(host => 1, vmids => '101');
 
-    ok($call->{error}, 'the host cannot be updated without Sys.Console');
+    ok($call->{error}, 'the host cannot be updated by anyone but root@pam, whatever privileges they hold');
     is(
         scalar(@{ $call->{forked} }),
         0,
@@ -217,7 +217,7 @@ sub call_run {
 # Checked at the hand-over, because a run that never receives the number runs
 # uncapped and still reports success.
 {
-    PVE::UpdateManager::Config::save_settings(
+    PVE::UpdateManager::Settings::save_settings(
         'pve-test', { parallel_manual => 1, parallel_manual_max => 3 },
     );
 
@@ -234,7 +234,7 @@ sub call_run {
     is($opts->{parallel}, 1, 'the run is parallel, as the node says');
     is($opts->{parallel_max}, 3, 'and capped at the number the node stores');
 
-    PVE::UpdateManager::Config::save_settings(
+    PVE::UpdateManager::Settings::save_settings(
         'pve-test', { parallel_manual => 0, parallel_manual_max => 0 },
     );
 }
@@ -282,4 +282,27 @@ sub call_run {
         ['lxc:101', 'qemu:200'],
         'one request with a container and a VM hands each to the job as what it is',
     );
+}
+
+# ── the snapshot switches are offered where a VM can snapshot, too ──────────
+#
+# VMs are snapshotted with the same settings as containers, so a node whose
+# only snapshot-capable guest is a VM must still show the Snapshots section -
+# otherwise the switches that apply to its VMs are hidden from it.
+{
+    my $get_settings = PVE::RESTHandler::registered('PVE::UpdateManager::NodeAPI', 'get_settings');
+
+    local %PVE::LXC::CONFIG_LIST = (101 => {});
+    local $PVE::LXC::Config::NO_SNAPSHOT{101} = 1;
+    local %PVE::QemuServer::CONFIG_LIST = ();
+
+    is($get_settings->({ node => 'pve-test' })->{snapshot_capable}, 0,
+        'premise: a node whose only container cannot snapshot offers no snapshot switches');
+
+    local %PVE::QemuServer::CONFIG_LIST = (200 => {});
+    local %PVE::QemuConfig::CONFIGS = (200 => { name => 'vm-web', agent => '1' });
+    local $PVE::LXC::Config::NO_CONFIG{200} = 1;
+
+    is($get_settings->({ node => 'pve-test' })->{snapshot_capable}, 1,
+        'a VM that can snapshot is enough to offer them');
 }

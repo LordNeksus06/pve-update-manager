@@ -224,6 +224,9 @@ claim('a run that failed looks failed in the list, with its note', () => {
 
     assert.match(updmgr.renderLogState('ok'), /fa-check/);
     assert.match(updmgr.renderLogState('skipped'), /fa-minus/);
+    // #73: read back from 'result:   NOT FIXED (...)' as not_fixed.
+    assert.match(updmgr.renderLogState('not_fixed', 'openssl'), /NOT FIXED/);
+    assert.doesNotMatch(updmgr.renderLogState('not_fixed'), /no result/);
 });
 
 claim('a log with no header says so rather than passing as OK', () => {

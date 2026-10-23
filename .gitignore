@@ -3,3 +3,6 @@ deb-out/
 *.tar.gz
 # Worktrees of parallel sessions: full copies of the tree, never content.
 .claude/worktrees/
+# Built from js/src by make - see JS_BUNDLE in the Makefile.
+js/pve-update-manager.js
+js/pve-update-manager.js.tmp

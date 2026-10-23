@@ -12,7 +12,7 @@ use warnings;
 
 use File::Temp qw(tempdir);
 use IO::Handle;
-use Test::More tests => 43;
+use Test::More tests => 39;
 
 use PVE::LXC;
 use PVE::LXC::Config;
@@ -24,12 +24,15 @@ use PVE::Tools;
 use PVE::UpdateManager::Config;
 use PVE::UpdateManager::Guest;
 use PVE::UpdateManager::Job;
+use PVE::UpdateManager::Logs;
 use PVE::UpdateManager::QemuRunner;
 use PVE::UpdateManager::Runner;
 
 my $dir = tempdir(CLEANUP => 1);
 $PVE::UpdateManager::Config::BASE_DIR = "$dir/store";
-$PVE::UpdateManager::Config::LOG_DIR = "$dir/logs";
+# The target lock directory is root's below /run (#71); a test user cannot make it.
+$PVE::UpdateManager::Config::LOCK_DIR = "$dir/locks";
+$PVE::UpdateManager::Logs::LOG_DIR = "$dir/logs";
 
 # See job.t: no busctl and no systemd-inhibit in a unit test.
 $PVE::UpdateManager::Runner::CGROUP_FILE = "$dir/no-such-cgroup";
@@ -177,15 +180,7 @@ ok(!PVE::UpdateManager::Guest::agent_enabled({}), 'no agent line is off');
     is(scalar(@{ $r->{vm_runs} }), 0, 'and not run');
 }
 
-{
-    my $r = run_vm_target(202, { start_stopped => 1 });
-    like(
-        $r->{out},
-        qr/SKIPPED \(VM is not running - starting stopped VMs for their update is not supported yet\)/,
-        'with "start stopped" on it is still skipped, and the row says that the setting did not apply',
-    );
-    is(scalar(@{ $r->{vm_runs} }), 0, 'nothing tries to start it');
-}
+# Starting a stopped VM, snapshots and the reboot are in vm-lifecycle.t.
 
 # The owner's decision: no agent is RED and notifies, not a quiet skip.
 {
@@ -222,13 +217,4 @@ ok(!PVE::UpdateManager::Guest::agent_enabled({}), 'no agent line is off');
     like($r->{out}, qr/SKIPPED \(another task holds the lock \(VM is locked \(migrate\)\)\)/,
         'a lock taken in the gap is a skip');
     is(scalar(@{ $r->{vm_runs} }), 0, 'and nothing is run');
-}
-
-# ── what a VM does not have yet ─────────────────────────────────────────────
-{
-    local %PVE::LXC::Config::LOCKS = ();
-    my $r = run_vm_target(200, { snapshot_before => 1, snapshot_keep => 3 });
-    like($r->{out}, qr/snapshots of VMs are not supported yet - updating without one/,
-        'with snapshots on, the log says the VM gets none');
-    is(scalar(@{ $r->{vm_runs} }), 1, 'and the update still runs');
 }

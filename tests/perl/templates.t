@@ -10,7 +10,7 @@ use strict;
 use warnings;
 
 use File::Temp qw(tempdir);
-use Test::More tests => 66;
+use Test::More tests => 74;
 
 use PVE::Tools;
 use PVE::UpdateManager::Config;
@@ -97,7 +97,40 @@ sub script_of {
         qr/--without-new-pkgs upgrade/,
         'and does the minimal upgrade before the full one, as the release notes prescribe',
     );
-    like($major, qr/TARGET_RELEASE=/, 'the release to go to is named, not guessed');
+    # Run, not read: the release table is a shell function, and bash answers
+    # for it. #51: a fixed TARGET_RELEASE=trixie took a bullseye container
+    # straight to trixie, skipping bookworm, which Debian does not support.
+    my ($fn) = $major =~ m/^(next_release\(\) \{\n.*?\n\})$/ms;
+    ok(defined($fn), 'premise: the release table is a function of its own');
+    my $next = sub {
+        my ($codename) = @_;
+        my $out = `bash -c '$fn\nnext_release "\$1"; echo "rc=\$?"' _ $codename`;
+        chomp($out);
+        return $out;
+    };
+    is($next->('bullseye'), "bookworm\nrc=0", 'bullseye goes to bookworm, one release, not straight to trixie');
+    is($next->('bookworm'), "trixie\nrc=0", 'bookworm goes to trixie');
+    is($next->('trixie'), "\nrc=0", 'trixie has no successor this template knows - nothing to do, not an error');
+    is($next->('buster'), 'rc=1', 'buster is refused: its archive moved and needs a hand on the sources');
+    is($next->('sid'), 'rc=1', 'an unknown codename is refused, not guessed');
+
+    # Order matters as much as presence: the merge has to happen on the
+    # current release, BEFORE any source names trixie, and a merge that did
+    # not happen has to stop the run there (the opt-out case, measured on a
+    # debootstrap --no-merged-usr bookworm: usrmerge installs, exits 0 and
+    # converts nothing).
+    # Anchored to the whole line: a substring would also find a disabled
+    # ": apt-get -y install usrmerge" (mutant M2 of #51 survived that way).
+    my $merge = $major =~ m/^\s*apt-get -y install usrmerge$/m ? $-[0] : -1;
+    my $check = index($major, 'is still not merged after installing usrmerge');
+    my $rewrite = index($major, 'for f in /etc/apt/sources.list');
+    ok($merge > 0 && $rewrite > 0, 'premise: the merge and the source rewrite are both there');
+    ok($merge < $check && $check < $rewrite, 'usrmerge, then the check that it merged, then the rewrite');
+    like(
+        $major,
+        qr/if \[ "\$TARGET_RELEASE" = trixie \] && \[ ! -L \/bin \]; then/,
+        'only before trixie: from bullseye the bookworm upgrade merges by itself, and bullseye-security is gone',
+    );
     is(
         scalar(() = $major =~ m/^\s*apt-get update \$RELEASEINFO$/mg),
         2,

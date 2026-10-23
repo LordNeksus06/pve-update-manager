@@ -72,6 +72,7 @@ use Time::HiRes ();
 use PVE::QemuConfig;
 use PVE::QemuServer::Monitor;
 
+use PVE::UpdateManager::QemuScripts;
 use PVE::UpdateManager::Runner;
 
 our $POLL = 2;               # seconds between two looks at the log file
@@ -94,60 +95,9 @@ our $RM_WAIT = 0.2;
 # both files are removed again after the run.
 our $GUEST_DIR = '/var/tmp';
 
-# The guest half, in two parts. The OUTER part is what guest-exec starts: it
-# opens the log - with umask 077, because an update log can carry what a script
-# echoes and /var/tmp is world-readable - and hands over to the inner part in a
-# scope of its own. The INNER part travels as an argument rather than as a file:
-# nothing has to be written into the VM before the run can start.
-our $VM_OUTER = <<'EOS';
-log=$1
-inner=$2
-shift 2
-umask 077
-exec >"$log" 2>&1
-if command -v systemd-run >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-    exec systemd-run --scope --quiet --collect -- /bin/sh -c "$inner" pve-update-manager "$@"
-fi
-echo "WARNING: no systemd in this VM - if the update restarts qemu-guest-agent, as an upgrade of that package does, the update is killed with it"
-exec /bin/sh -c "$inner" pve-update-manager "$@"
-EOS
-
-# The time limit is enforced in here, by coreutils `timeout` in its own process
-# group, for the same reason as in a container: the host cannot kill a process
-# inside a VM, it can only stop waiting for it.
-#
-# The exit code goes into its own file, renamed into place so the host never
-# reads half of it. That file is how the end of a run is noticed after the agent
-# was restarted and has forgotten the pid.
-#
-# Unlike the container prologue there is no raw-script fallback for a guest
-# without base64: the raw script is exactly what must not cross the agent.
-our $VM_INNER = <<'EOS';
-rcf=$1
-secs=$2
-grace=$3
-b64=$4
-shift 4
-if script=$(printf %s "$b64" | base64 -d 2>/dev/null) && [ -n "$script" ]; then
-    HOME=/root
-    USER=root
-    LOGNAME=root
-    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-    export HOME USER LOGNAME PATH
-    if timeout -k 1 1 true 2>/dev/null; then
-        timeout -k "$grace" "$secs" "$@" -c "$script"
-    else
-        echo "WARNING: no usable 'timeout' in this VM - a run that exceeds ${secs}s will be abandoned, not killed"
-        "$@" -c "$script"
-    fi
-    rc=$?
-else
-    echo "ERROR: no usable 'base64' in this VM - the update script cannot be passed in"
-    rc=127
-fi
-echo "$rc" >"$rcf.tmp" && mv -f "$rcf.tmp" "$rcf"
-exit "$rc"
-EOS
+# The guest half: QemuScripts.pm, where the reasons for each line are.
+our $VM_OUTER = $PVE::UpdateManager::QemuScripts::VM_OUTER;
+our $VM_INNER = $PVE::UpdateManager::QemuScripts::VM_INNER;
 
 # ── Keeping the VM from being switched off mid-update ─────────────────────
 #
@@ -316,12 +266,19 @@ sub _exit_code {
     return int($status->{exitcode} // -1);
 }
 
+# The run's private directory inside the VM and the two files in it. The name
+# is random (#72): a guessable one let another user of the VM take it first.
 sub _guest_files {
     my ($vmid) = @_;
 
-    my $stem = "$GUEST_DIR/pve-update-manager-$vmid-" . time() . "-$$";
+    open(my $fh, '<', '/dev/urandom') or die "cannot read /dev/urandom: $!\n";
+    my $got = sysread($fh, my $bytes, 16);
+    close($fh);
+    die "cannot read /dev/urandom\n" if !$got || $got != 16;
 
-    return ("$stem.log", "$stem.rc");
+    my $dir = "$GUEST_DIR/pve-update-manager-$vmid-" . unpack('H*', $bytes);
+
+    return ($dir, "$dir/run.log", "$dir/run.rc");
 }
 
 # Returns the script's exit code like run_lxc does: 124 for the time limit, 128+n
@@ -333,12 +290,12 @@ sub run_vm {
     my $safe_vmid = PVE::UpdateManager::Runner::_safe_vmid($vmid);
     my $secs = PVE::UpdateManager::Runner::_limit($timeout);
     my $interp = PVE::UpdateManager::Runner::interpreter($script);
-    my ($log, $rcf) = _guest_files($safe_vmid);
+    my ($dir, $log, $rcf) = _guest_files($safe_vmid);
 
     # Strings, every one: the mirror image of the pid trap above.
     my @args = map { "$_" } (
         '-c', $VM_OUTER, 'pve-update-manager',
-        $log, $VM_INNER,
+        $dir, $log, $VM_INNER,
         $rcf, $secs, $PVE::UpdateManager::Runner::KILL_GRACE,
         encode_base64(PVE::UpdateManager::Runner::to_bytes($script), ''),
         @$interp,
@@ -373,7 +330,7 @@ sub run_vm {
 
     my ($rc, $handle) = _follow($safe_vmid, $pid, $log, $rcf, $secs, $logfunc);
 
-    _cleanup($safe_vmid, $handle, [$log, $rcf], $logfunc);
+    _cleanup($safe_vmid, $handle, $dir, $logfunc);
 
     return $rc;
 }
@@ -473,7 +430,7 @@ sub _follow {
 
 # Never dies, and never decides the outcome: the run has already happened.
 sub _cleanup {
-    my ($vmid, $handle, $files, $logfunc) = @_;
+    my ($vmid, $handle, $dir, $logfunc) = @_;
 
     eval { _agent($vmid, 'guest-file-close', handle => int($handle)) } if defined($handle);
 
@@ -481,7 +438,9 @@ sub _cleanup {
     # result of every guest-exec until somebody fetches it, so an `rm` that is
     # started and forgotten would leave one entry behind in the agent per run.
     my $removed = eval {
-        my $pid = int(_agent($vmid, 'guest-exec', path => '/bin/rm', arg => ['-f', '--', @$files])->{pid});
+        # The directory and whatever is in it: log, exit code, a half-written
+        # exit code. Its name is the host's own random one under $GUEST_DIR.
+        my $pid = int(_agent($vmid, 'guest-exec', path => '/bin/rm', arg => ['-rf', '--', $dir])->{pid});
         my $status;
         for (1 .. $RM_TRIES) {
             $status = _agent($vmid, 'guest-exec-status', pid => $pid);
@@ -490,7 +449,7 @@ sub _cleanup {
         }
         $status->{exited} && !$status->{exitcode} && !defined($status->{signal});
     };
-    $logfunc->("WARNING: could not remove " . join(' and ', @$files) . " inside VM $vmid"
+    $logfunc->("WARNING: could not remove $dir inside VM $vmid"
         . ($@ ? " - $@" : ''))
         if !$removed;
 

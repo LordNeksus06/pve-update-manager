@@ -15,6 +15,7 @@ use Test::More tests => 40;
 
 use PVE::Tools;
 use PVE::UpdateManager::Config;
+use PVE::UpdateManager::Versions;
 
 my $dir = tempdir(CLEANUP => 1);
 $PVE::UpdateManager::Config::BASE_DIR = "$dir/store";
@@ -70,7 +71,7 @@ unlink("$dir/store/lxc-101.order");
     my $got = eval { PVE::UpdateManager::Config::load_order('lxc', '../etc/passwd') };
     is($got, 0, 'an impossible id reads as unset rather than dying');
 
-    my $versions = eval { PVE::UpdateManager::Config::list_versions('lxc', '../etc/passwd') };
+    my $versions = eval { PVE::UpdateManager::Versions::list_versions('lxc', '../etc/passwd') };
     is_deeply($versions, [], 'and asking for its history answers with nothing');
 }
 

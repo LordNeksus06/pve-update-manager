@@ -17,20 +17,22 @@ use POSIX ();
 use PVE::INotify;
 use PVE::Tools;
 use PVE::UpdateManager::Config;
+use PVE::UpdateManager::Settings;
+use PVE::UpdateManager::Versions;
 
 my $dir = tempdir(CLEANUP => 1);
 $PVE::UpdateManager::Config::BASE_DIR = "$dir/store";
 
 # ── the first save is version one ───────────────────────────────────────────
 is_deeply(
-    PVE::UpdateManager::Config::list_versions('lxc', 101),
+    PVE::UpdateManager::Versions::list_versions('lxc', 101),
     [],
     'a target nobody has saved has no history - and asking does not die on the missing directory',
 );
 
 PVE::UpdateManager::Config::save_script('lxc', 101, "first\n", 'root@pam');
 
-my $versions = PVE::UpdateManager::Config::list_versions('lxc', 101);
+my $versions = PVE::UpdateManager::Versions::list_versions('lxc', 101);
 is(scalar(@$versions), 1, 'the first save is recorded');
 is($versions->[0]->{user}, 'root@pam', 'together with who made it');
 like(
@@ -42,7 +44,7 @@ ok($versions->[0]->{time} > 0, 'with the same moment as a second, for rendering'
 is($versions->[0]->{size}, length("first\n"), 'and how big it is');
 
 is(
-    PVE::UpdateManager::Config::load_version('lxc', 101, $versions->[0]->{version}),
+    PVE::UpdateManager::Versions::load_version('lxc', 101, $versions->[0]->{version}),
     "first\n",
     'the version reads back byte for byte',
 );
@@ -51,7 +53,7 @@ is(
 # makes when it labels the top entry "latest save".
 my ($current) = PVE::UpdateManager::Config::load_script('lxc', 101);
 is(
-    PVE::UpdateManager::Config::load_version('lxc', 101, $versions->[0]->{version}),
+    PVE::UpdateManager::Versions::load_version('lxc', 101, $versions->[0]->{version}),
     $current,
     'and it is the text that is stored now',
 );
@@ -59,7 +61,7 @@ is(
 # ── a save that changes nothing writes nothing ──────────────────────────────
 PVE::UpdateManager::Config::save_script('lxc', 101, "first\n", 'root@pam');
 is(
-    scalar(@{ PVE::UpdateManager::Config::list_versions('lxc', 101) }),
+    scalar(@{ PVE::UpdateManager::Versions::list_versions('lxc', 101) }),
     1,
     'pressing Save without changing anything does not push the history out',
 );
@@ -73,15 +75,15 @@ PVE::UpdateManager::Config::save_script('lxc', 101, "second\n", 'root@pam');
 PVE::UpdateManager::Config::save_script('lxc', 101, "third\n", 'alice@pve');
 PVE::UpdateManager::Config::save_script('lxc', 101, "fourth\n");
 
-$versions = PVE::UpdateManager::Config::list_versions('lxc', 101);
+$versions = PVE::UpdateManager::Versions::list_versions('lxc', 101);
 is(scalar(@$versions), 3, 'the default keeps three');
 is(
-    PVE::UpdateManager::Config::load_version('lxc', 101, $versions->[0]->{version}),
+    PVE::UpdateManager::Versions::load_version('lxc', 101, $versions->[0]->{version}),
     "fourth\n",
     'the newest first',
 );
 is(
-    PVE::UpdateManager::Config::load_version('lxc', 101, $versions->[2]->{version}),
+    PVE::UpdateManager::Versions::load_version('lxc', 101, $versions->[2]->{version}),
     "second\n",
     'and the oldest of the three that are left is the second save',
 );
@@ -97,14 +99,14 @@ ok($times[0] > $times[1] && $times[1] > $times[2], 'the list is strictly newest 
 ok($stamps[0] gt $stamps[1] && $stamps[1] gt $stamps[2], 'and the names sort the same way');
 
 # ── restoring is a normal save ──────────────────────────────────────────────
-my $old = PVE::UpdateManager::Config::load_version('lxc', 101, $stamps[2]);
+my $old = PVE::UpdateManager::Versions::load_version('lxc', 101, $stamps[2]);
 PVE::UpdateManager::Config::save_script('lxc', 101, $old, 'root@pam');
 
 ($current) = PVE::UpdateManager::Config::load_script('lxc', 101);
 is($current, "second\n", 'the older text is stored again');
-$versions = PVE::UpdateManager::Config::list_versions('lxc', 101);
+$versions = PVE::UpdateManager::Versions::list_versions('lxc', 101);
 is(
-    PVE::UpdateManager::Config::load_version('lxc', 101, $versions->[0]->{version}),
+    PVE::UpdateManager::Versions::load_version('lxc', 101, $versions->[0]->{version}),
     "second\n",
     'and the restore is itself the newest version',
 );
@@ -112,67 +114,67 @@ is(scalar(@$versions), 3, 'still three, so a restore does not grow the history')
 
 # ── the retention count is a setting ────────────────────────────────────────
 is(
-    PVE::UpdateManager::Config::load_settings('pve-test')->{script_versions},
+    PVE::UpdateManager::Settings::load_settings('pve-test')->{script_versions},
     3,
     'three by default',
 );
 
-PVE::UpdateManager::Config::save_settings('pve-test', { script_versions => 1 });
+PVE::UpdateManager::Settings::save_settings('pve-test', { script_versions => 1 });
 PVE::UpdateManager::Config::save_script('lxc', 101, "only-one\n", 'root@pam');
 
-$versions = PVE::UpdateManager::Config::list_versions('lxc', 101);
+$versions = PVE::UpdateManager::Versions::list_versions('lxc', 101);
 is(scalar(@$versions), 1, 'lowering it drops the rest on the next save');
 is(
-    PVE::UpdateManager::Config::load_version('lxc', 101, $versions->[0]->{version}),
+    PVE::UpdateManager::Versions::load_version('lxc', 101, $versions->[0]->{version}),
     "only-one\n",
     'and what is kept is the newest, not the oldest',
 );
 
 # A hand-edited settings file must not be able to disarm this: 0 would delete
 # the version of the save being made.
-PVE::UpdateManager::Config::_write_settings(
+PVE::UpdateManager::Settings::_write_settings(
     'pve-test',
-    { %{ PVE::UpdateManager::Config::load_settings('pve-test') }, script_versions => 0 },
+    { %{ PVE::UpdateManager::Settings::load_settings('pve-test') }, script_versions => 0 },
 );
 is(
-    PVE::UpdateManager::Config::load_settings('pve-test')->{script_versions},
+    PVE::UpdateManager::Settings::load_settings('pve-test')->{script_versions},
     1,
     'a zero in the settings file is clamped to one, not obeyed',
 );
 
 ok(
     !defined(eval {
-        PVE::UpdateManager::Config::save_settings('pve-test', { script_versions => 0 });
+        PVE::UpdateManager::Settings::save_settings('pve-test', { script_versions => 0 });
         1;
     }),
     'and the API refuses it outright',
 );
 ok(
     !defined(eval {
-        PVE::UpdateManager::Config::save_settings('pve-test', { script_versions => 51 });
+        PVE::UpdateManager::Settings::save_settings('pve-test', { script_versions => 51 });
         1;
     }),
     'as it does a count above the maximum',
 );
 
-PVE::UpdateManager::Config::save_settings('pve-test', { script_versions => 3 });
+PVE::UpdateManager::Settings::save_settings('pve-test', { script_versions => 3 });
 
 # ── the name a save is stored under ─────────────────────────────────────────
 #
 # Readable without decoding anything, which is the point: `ls` answers "when was
 # this saved" by itself.
 is(
-    PVE::UpdateManager::Config::version_file('lxc', 101, '2026-08-21-13-21-12', 'root@pam'),
+    PVE::UpdateManager::Versions::version_file('lxc', 101, '2026-08-21-13-21-12', 'root@pam'),
     "$dir/store/lxc-101\@2026-08-21-13-21-12-root\@pam.conf",
     'the file is named after the local second and the user, and ends in .conf',
 );
 is(
-    PVE::UpdateManager::Config::version_file('lxc', 101, '2026-08-21-13-21-12'),
+    PVE::UpdateManager::Versions::version_file('lxc', 101, '2026-08-21-13-21-12'),
     "$dir/store/lxc-101\@2026-08-21-13-21-12.conf",
     'and without a user where the API knew none',
 );
 is(
-    PVE::UpdateManager::Config::version_file('node', 'pve-test', '2026-08-21-13-21-12', 'root@pam'),
+    PVE::UpdateManager::Versions::version_file('node', 'pve-test', '2026-08-21-13-21-12', 'root@pam'),
     "$dir/store/node-pve-test\@2026-08-21-13-21-12-root\@pam.conf",
     'the host is named the same way',
 );
@@ -180,58 +182,58 @@ is(
 # The shape a version was saved under BEFORE this one existed. Still built, so a
 # node that was updated can still open and prune what is already on its disk.
 is(
-    PVE::UpdateManager::Config::version_file('lxc', 101, 1755690000, 'root@pam'),
+    PVE::UpdateManager::Versions::version_file('lxc', 101, 1755690000, 'root@pam'),
     "$dir/store/lxc-101.conf.1755690000.root\@pam",
     'an epoch identifier still builds the old name it belongs to',
 );
 
 # ── a user id may never become a path ───────────────────────────────────────
 is(
-    PVE::UpdateManager::Config::version_file('lxc', 101, '2026-08-21-13-21-12', '../../etc/passwd'),
+    PVE::UpdateManager::Versions::version_file('lxc', 101, '2026-08-21-13-21-12', '../../etc/passwd'),
     "$dir/store/lxc-101\@2026-08-21-13-21-12.conf",
     'a user id that would walk out of the directory is dropped, not used',
 );
 is(
-    PVE::UpdateManager::Config::version_file('lxc', 101, '2026-08-21-13-21-12', "root\@pam\nx"),
+    PVE::UpdateManager::Versions::version_file('lxc', 101, '2026-08-21-13-21-12', "root\@pam\nx"),
     "$dir/store/lxc-101\@2026-08-21-13-21-12.conf",
     'and so is one carrying a newline',
 );
 ok(
-    !defined(eval { PVE::UpdateManager::Config::version_file('lxc', 101, '1;rm -rf /') }),
+    !defined(eval { PVE::UpdateManager::Versions::version_file('lxc', 101, '1;rm -rf /') }),
     'a version that is neither shape is refused',
 );
 ok(
-    !defined(eval { PVE::UpdateManager::Config::version_file('lxc', 101, '2026-08-21-13-21') }),
+    !defined(eval { PVE::UpdateManager::Versions::version_file('lxc', 101, '2026-08-21-13-21') }),
     'and so is a timestamp with a field missing - it would sort against the others wrongly',
 );
 ok(
     !defined(eval {
-        PVE::UpdateManager::Config::version_file('lxc', 101, '../../2026-08-21-13-21-12');
+        PVE::UpdateManager::Versions::version_file('lxc', 101, '../../2026-08-21-13-21-12');
     }),
     'and one that tries to climb out of the directory',
 );
 ok(
-    !defined(eval { PVE::UpdateManager::Config::load_version('lxc', 101, '../lxc-102.conf') }),
+    !defined(eval { PVE::UpdateManager::Versions::load_version('lxc', 101, '../lxc-102.conf') }),
     'and so is one that tries to read another target',
 );
 
 # A version that is not there is not an error either - it is an empty answer the
 # API turns into a 400 with a name on it.
 ok(
-    !defined(PVE::UpdateManager::Config::load_version('lxc', 101, 1)),
+    !defined(PVE::UpdateManager::Versions::load_version('lxc', 101, 1)),
     'asking for a version that does not exist answers with nothing',
 );
 
 # ── the history is per target ───────────────────────────────────────────────
 PVE::UpdateManager::Config::save_script('lxc', 102, "other\n", 'root@pam');
 is(
-    scalar(@{ PVE::UpdateManager::Config::list_versions('lxc', 102) }),
+    scalar(@{ PVE::UpdateManager::Versions::list_versions('lxc', 102) }),
     1,
     'a second container has its own history',
 );
 is(
-    PVE::UpdateManager::Config::load_version(
-        'lxc', 102, PVE::UpdateManager::Config::list_versions('lxc', 102)->[0]->{version},
+    PVE::UpdateManager::Versions::load_version(
+        'lxc', 102, PVE::UpdateManager::Versions::list_versions('lxc', 102)->[0]->{version},
     ),
     "other\n",
     'and it is not the first one\'s',
@@ -239,7 +241,7 @@ is(
 
 PVE::UpdateManager::Config::save_script('node', 'pve-test', "host\n", 'root@pam');
 is(
-    scalar(@{ PVE::UpdateManager::Config::list_versions('node', 'pve-test') }),
+    scalar(@{ PVE::UpdateManager::Versions::list_versions('node', 'pve-test') }),
     1,
     'the host has one too',
 );
@@ -247,20 +249,20 @@ is(
 # ── delete keeps the history, purge takes it ────────────────────────────────
 PVE::UpdateManager::Config::delete_script('lxc', 102);
 is(
-    scalar(@{ PVE::UpdateManager::Config::list_versions('lxc', 102) }),
+    scalar(@{ PVE::UpdateManager::Versions::list_versions('lxc', 102) }),
     1,
     'removing the commands leaves the history - it is what makes that undoable',
 );
 
-is(PVE::UpdateManager::Config::delete_versions('lxc', 102), 1, 'a purge removes it');
+is(PVE::UpdateManager::Versions::delete_versions('lxc', 102), 1, 'a purge removes it');
 is_deeply(
-    PVE::UpdateManager::Config::list_versions('lxc', 102),
+    PVE::UpdateManager::Versions::list_versions('lxc', 102),
     [],
     'and then there is nothing left to restore',
 );
 is(
-    PVE::UpdateManager::Config::load_version(
-        'lxc', 101, PVE::UpdateManager::Config::list_versions('lxc', 101)->[0]->{version},
+    PVE::UpdateManager::Versions::load_version(
+        'lxc', 101, PVE::UpdateManager::Versions::list_versions('lxc', 101)->[0]->{version},
     ),
     "only-one\n",
     'and the other container keeps its own, which is what per-target storage means',
@@ -293,7 +295,7 @@ is(
 
     for my $user (sort keys %expected) {
         my $want = $expected{$user};
-        my $got = PVE::UpdateManager::Config::_version_user($user);
+        my $got = PVE::UpdateManager::Versions::_version_user($user);
         my $shown = ($user =~ s/\n/\\n/gr);
         if (defined($want)) {
             is($got, $want, "'$shown' is kept as the author");
@@ -307,10 +309,10 @@ is(
 {
     PVE::UpdateManager::Config::save_script('lxc', 105, "by a token\n", 'root@pam!ci');
 
-    my $versions = PVE::UpdateManager::Config::list_versions('lxc', 105);
+    my $versions = PVE::UpdateManager::Versions::list_versions('lxc', 105);
     is($versions->[0]->{user}, 'root@pam!ci', 'a token save is listed with its token');
     is(
-        PVE::UpdateManager::Config::load_version('lxc', 105, $versions->[0]->{version}),
+        PVE::UpdateManager::Versions::load_version('lxc', 105, $versions->[0]->{version}),
         "by a token\n",
         'and the text reads back',
     );
@@ -331,7 +333,7 @@ is(
     PVE::Tools::file_set_contents("$dir/store/lxc-777.conf.1700000000.root\@pam", "ancient\n");
     PVE::Tools::file_set_contents("$dir/store/lxc-777.conf.1700000001", "ancient too\n");
 
-    my $mixed = PVE::UpdateManager::Config::list_versions('lxc', 777);
+    my $mixed = PVE::UpdateManager::Versions::list_versions('lxc', 777);
     is(scalar(@$mixed), 3, 'both shapes are listed together');
     is(
         scalar(grep { $_->{version} =~ m/\A[0-9]{4}(-[0-9]{2}){5}\z/ } @$mixed),
@@ -349,7 +351,7 @@ is(
         'the oldest is last, whichever shape it happens to have',
     );
     is(
-        PVE::UpdateManager::Config::load_version('lxc', 777, '1700000000'),
+        PVE::UpdateManager::Versions::load_version('lxc', 777, '1700000000'),
         "ancient\n",
         'an old version still opens by the identifier it was listed under',
     );
@@ -359,8 +361,8 @@ is(
     # And they are the ones the retention count drops, because they are the
     # oldest - which is how a node grows out of the old shape without anybody
     # moving a file.
-    is(PVE::UpdateManager::Config::prune_versions('lxc', 777, 1), 2, 'the two oldest go');
-    my $left = PVE::UpdateManager::Config::list_versions('lxc', 777);
+    is(PVE::UpdateManager::Versions::prune_versions('lxc', 777, 1), 2, 'the two oldest go');
+    my $left = PVE::UpdateManager::Versions::list_versions('lxc', 777);
     is(scalar(@$left), 1, 'one is left');
     like(
         $left->[0]->{version},
@@ -382,10 +384,10 @@ is(
     local $ENV{TZ} = 'Europe/Berlin';
     POSIX::tzset();
 
-    my $stamp = PVE::UpdateManager::Config::version_stamp(1787310000);
+    my $stamp = PVE::UpdateManager::Versions::version_stamp(1787310000);
     like($stamp, qr/\A[0-9]{4}(-[0-9]{2}){5}\z/, 'a stamp is the fixed, padded shape');
     is(
-        PVE::UpdateManager::Config::stamp_epoch($stamp),
+        PVE::UpdateManager::Versions::stamp_epoch($stamp),
         1787310000,
         'and it converts back to the second it came from',
     );
@@ -397,8 +399,8 @@ is(
     my $first = 1792888220;   # 2026-10-25 02:30:20 CEST
     my $second = $first + 3600;
     is(
-        PVE::UpdateManager::Config::version_stamp($first),
-        PVE::UpdateManager::Config::version_stamp($second),
+        PVE::UpdateManager::Versions::version_stamp($first),
+        PVE::UpdateManager::Versions::version_stamp($second),
         'two instants an hour apart in the repeated hour want the same name',
     );
     isnt($first, $second, 'and they are genuinely different seconds');
@@ -409,36 +411,36 @@ is(
     # with the range check removed, '2026-99-99-99-99-99' converted to a
     # perfectly good epoch in 2034.
     is(
-        PVE::UpdateManager::Config::stamp_epoch('2026-13-01-01-01-01'),
+        PVE::UpdateManager::Versions::stamp_epoch('2026-13-01-01-01-01'),
         undef,
         'a thirteenth month is not a date, and not a sort key either',
     );
     is(
-        PVE::UpdateManager::Config::stamp_epoch('2026-08-32-01-01-01'),
+        PVE::UpdateManager::Versions::stamp_epoch('2026-08-32-01-01-01'),
         undef,
         'nor is a thirty-second day',
     );
     is(
-        PVE::UpdateManager::Config::stamp_epoch('2026-08-21-24-01-01'),
+        PVE::UpdateManager::Versions::stamp_epoch('2026-08-21-24-01-01'),
         undef,
         'nor a twenty-fourth hour',
     );
     is(
-        PVE::UpdateManager::Config::stamp_epoch('2026-08-21-01-60-01'),
+        PVE::UpdateManager::Versions::stamp_epoch('2026-08-21-01-60-01'),
         undef,
         'nor a sixtieth minute',
     );
     is(
-        PVE::UpdateManager::Config::stamp_epoch('2026-08-21-00-00-00'),
-        PVE::UpdateManager::Config::stamp_epoch('2026-08-21-00-00-00'),
+        PVE::UpdateManager::Versions::stamp_epoch('2026-08-21-00-00-00'),
+        PVE::UpdateManager::Versions::stamp_epoch('2026-08-21-00-00-00'),
         'while a date that IS one converts, and converts the same way twice',
     );
     ok(
-        defined(PVE::UpdateManager::Config::stamp_epoch('2026-12-31-23-59-60')),
+        defined(PVE::UpdateManager::Versions::stamp_epoch('2026-12-31-23-59-60')),
         'and a leap second is a local time localtime() will print, so it is kept',
     );
     is(
-        PVE::UpdateManager::Config::stamp_epoch('nonsense'),
+        PVE::UpdateManager::Versions::stamp_epoch('nonsense'),
         undef,
         'and neither is something that is not a date at all',
     );
@@ -456,7 +458,7 @@ is(
     PVE::UpdateManager::Config::save_script('lxc', 779, "new shape\n", 'root@pam');
     PVE::Tools::file_set_contents("$dir/store/lxc-779.conf.1900000000.root\@pam", "later\n");
 
-    my $list = PVE::UpdateManager::Config::list_versions('lxc', 779);
+    my $list = PVE::UpdateManager::Versions::list_versions('lxc', 779);
     is(scalar(@$list), 2, 'both are listed');
     is(
         $list->[0]->{version},
@@ -464,7 +466,7 @@ is(
         'and the one with the later SECOND is first, whatever its name sorts as',
     );
     is(
-        PVE::UpdateManager::Config::load_version('lxc', 779, $list->[0]->{version}),
+        PVE::UpdateManager::Versions::load_version('lxc', 779, $list->[0]->{version}),
         "later\n",
         'so the newest version is the one that opens as the newest',
     );
@@ -476,7 +478,7 @@ is(
     PVE::UpdateManager::Config::save_script('lxc', 778, "real\n", 'root@pam');
     PVE::Tools::file_set_contents("$dir/store/lxc-778\@2026-99-99-99-99-99-root\@pam.conf", "no\n");
 
-    my $list = PVE::UpdateManager::Config::list_versions('lxc', 778);
+    my $list = PVE::UpdateManager::Versions::list_versions('lxc', 778);
     is(scalar(@$list), 1, 'the impossible one is left out');
     like($list->[0]->{version}, qr/\A2026-/, 'and the real one is still there');
 }

@@ -6,6 +6,8 @@ package PVE::Tools;
 use strict;
 use warnings;
 
+use Fcntl ();
+
 # Enough of a UPID parser for the staleness check: UPID:node:pid:pstart:...
 sub upid_decode {
     my ($upid, $noerr) = @_;
@@ -43,14 +45,25 @@ sub file_get_contents {
     return $data;
 }
 
+# The mode is the real one's: PVE::File::file_set_contents opens
+# "$filename.tmp.$$" with O_CREAT|O_EXCL and $perm - 0644 when none is given -
+# and renames it over the target. So a file it replaces gets the NEW mode, and a
+# caller that passes none gets a world-readable file. A stub that opened the
+# target with '>' would keep an old file's mode and make the tests of a private
+# file's mode prove nothing.
 sub file_set_contents {
     my ($filename, $data, $perm) = @_;
 
-    open(my $fh, '>', $filename)
+    $perm //= 0644;
+    my $tmp = "$filename.tmp.$$";
+    unlink($tmp);
+    sysopen(my $fh, $tmp, Fcntl::O_WRONLY() | Fcntl::O_CREAT() | Fcntl::O_EXCL(), $perm)
         or die "unable to open '$filename' - $!\n";
     print $fh $data;
     close($fh)
         or die "unable to write '$filename' - $!\n";
+    rename($tmp, $filename)
+        or die "unable to rename '$tmp' - $!\n";
 
     return;
 }

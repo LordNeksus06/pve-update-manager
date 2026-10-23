@@ -1,0 +1,14 @@
+{{status-text}}
+
+{{#each targets}}
+{{this.target}}: {{this.count}} pending
+{{#if this.warning}}
+{{this.warning}}
+{{/if}}
+{{#each this.packages}}
+  {{this.name}}  {{this.installed}} -> {{this.fixed}}  (severity: {{this.urgency}})
+{{/each}}
+
+{{/each}}
+Found by the background security check of the Update Manager. Nothing has
+been installed by the check itself.
