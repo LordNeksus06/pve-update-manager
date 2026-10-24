@@ -6,9 +6,9 @@ normal Proxmox task and records how each target's last run ended.
 
 ![The Update Manager tab of a container, showing its stored apt commands](../docs/img/container-tab.png)
 
-![The node view listing the host and its containers with their last run state](../docs/img/node-grid.png)
+![The node view listing the host, its containers and VMs with their last run and pending security updates, under the community-addon notice](../docs/img/node-grid.png)
 
-![The popup editor for a single container's update commands](../docs/img/editor-window.png)
+![The popup editor for a single container's update commands, opened from the datacenter view](../docs/img/editor-window.png)
 
 ## Features
 
@@ -51,6 +51,10 @@ normal Proxmox task and records how each target's last run ended.
   `pvedaemon` no longer interrupts a dist-upgrade halfway through.
 - **Destroy cleanup** — Proxmox' destroy dialog offers to delete the stored
   commands with the container, ticked by default.
+- **Says what it is** — every Update Manager view and its settings window carry
+  a line saying this is a community addon, not part of Proxmox VE, and every
+  toolbar ends in *Report a problem*, which opens this project's issue tracker.
+  Problems with the addon belong there, not with Proxmox support.
 
 ## Install
 

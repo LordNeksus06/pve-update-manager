@@ -285,6 +285,17 @@ claim('the tabs are a tab panel that renders every tab up front', () => {
     assert.strictEqual(snapshot.tabConfig.hidden, true, 'the Snapshot tab starts hidden');
 });
 
+claim('the settings window carries the community-addon notice, for one node and for all (#78)', () => {
+    for (const global of [false, true]) {
+        const { me } = windowFor(global);
+        me.load = () => {};
+        me.callParent = () => {};
+        me.initComponent.call(me);
+        assert.strictEqual(JSON.stringify((me.dockedItems || []).map((d) => d.itemId)), '["updmgrAddonNotice"]',
+            `global=${global}`);
+    }
+});
+
 claim('the Snapshot tab is shown where a guest can be snapshotted, and for every node', () => {
     for (const [global, capable, hidden] of [[false, 0, true], [false, 1, false], [true, 0, false]]) {
         const { me, hiddenTabs } = windowFor(global, Object.assign({}, ANSWER, { snapshot_capable: capable }));

@@ -31,6 +31,55 @@ Ext.ns('PVE.updmgr');
 PVE.updmgr.TAB_TITLE = 'Update Manager';
 PVE.updmgr.TAB_ICON = 'fa fa-arrow-circle-o-up';
 
+// Where problems with this addon go (#78). The tab sits among Proxmox' own and
+// looks like one of them, so whoever hits a problem in it would write to
+// Proxmox support - who did not write it and cannot fix it. The public
+// repository, because that is the address anyone outside can reach.
+PVE.updmgr.PROJECT_URL = 'https://github.com/LordNeksus06/pve-update-manager';
+
+// The line at the top of every Update Manager tab and of its settings window,
+// visible without a click (owner, 2026-10-24: "das müsste im ui sofort
+// ersichtlich sein"). Docked rather than an item, so no panel's layout - a
+// grid, a script editor, a tabbed window - has to make room for it; the low
+// weight puts it above the panel's own toolbar.
+PVE.updmgr.addonNotice = function () {
+    let enc = Ext.String.htmlEncode;
+
+    return {
+        xtype: 'component',
+        dock: 'top',
+        weight: -100,
+        itemId: 'updmgrAddonNotice',
+        cls: 'pmx-hint',
+        padding: '5 10',
+        html:
+            '<i class="fa fa-info-circle"></i> ' +
+            enc(gettext('pve-update-manager is a community addon, not part of Proxmox VE. ' +
+                'Please report problems with it on GitHub, not to Proxmox support.')) +
+            ` <a href="${enc(PVE.updmgr.PROJECT_URL)}/issues" target="_blank" rel="noopener noreferrer">` +
+            `${enc(gettext('Report a problem'))}</a>`,
+    };
+};
+
+// The same address as a button at the end of every Update Manager toolbar
+// (#78, owner 2026-10-24: "ja mach das so") - for whoever reads buttons, not
+// banners. Through openUrl so a test can see where it goes without a browser.
+PVE.updmgr.openUrl = function (url) {
+    window.open(url, '_blank', 'noopener,noreferrer');
+};
+
+PVE.updmgr.reportButton = function () {
+    return {
+        text: gettext('Report a problem'),
+        iconCls: 'fa fa-bug',
+        itemId: 'updmgrReportButton',
+        tooltip: gettext('Opens the issue tracker of pve-update-manager on GitHub - not Proxmox support'),
+        handler: function () {
+            PVE.updmgr.openUrl(`${PVE.updmgr.PROJECT_URL}/issues`);
+        },
+    };
+};
+
 // How long to wait before re-reading a grid that has a target mid-run. Short
 // enough that a row stops spinning promptly, long enough not to hammer the API
 // through a whole dist-upgrade.

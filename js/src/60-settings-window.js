@@ -353,6 +353,7 @@ Ext.define('PVE.updmgr.SettingsWindow', {
         });
 
         Ext.apply(me, {
+            dockedItems: [PVE.updmgr.addonNotice()],
             title: me.global
                 ? gettext('Update Manager Settings: All Nodes')
                 : Ext.String.format(gettext('Update Manager Settings: {0}'), me.nodename),

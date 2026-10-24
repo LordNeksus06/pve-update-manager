@@ -835,6 +835,7 @@ Ext.define('PVE.updmgr.TargetGrid', {
         });
 
         Ext.apply(me, {
+            dockedItems: [PVE.updmgr.addonNotice()],
             store: store,
             // See reload(): the poller must not flash a mask every few seconds,
             // and the only way to be sure of that is for the mask never to
@@ -926,6 +927,7 @@ Ext.define('PVE.updmgr.TargetGrid', {
                         me.reload();
                     },
                 },
+                PVE.updmgr.reportButton(),
             ],
             columns: me.buildColumns(),
             listeners: {

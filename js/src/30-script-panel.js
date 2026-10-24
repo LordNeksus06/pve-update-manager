@@ -395,8 +395,10 @@ Ext.define('PVE.updmgr.ScriptPanel', {
                 me.openLogs();
             }),
         );
+        tbar.push('->', PVE.updmgr.reportButton());
 
         Ext.apply(me, {
+            dockedItems: [PVE.updmgr.addonNotice()],
             // Buttons on top, STATE at the bottom - and that split is what fixed
             // the row rather than any single button.
             //
